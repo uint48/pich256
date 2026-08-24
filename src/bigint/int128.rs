@@ -1,5 +1,5 @@
 use std::fmt;
-use std::ops::{Add, Mul, Neg, Sub};
+use std::ops::{Add, BitAnd, BitOr, BitXor, BitXorAssign, Mul, Neg, Not, Sub};
 
 
 /// In Rust, you actually already have a native,
@@ -106,6 +106,45 @@ impl Neg for Int128 {
     #[inline]
     fn neg(self) -> Self::Output {
         Self(self.0.wrapping_neg())
+    }
+}
+
+impl BitXor for Int128 {
+    type Output = Self;
+    #[inline]
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        Self(self.0 ^ rhs.0)
+    }
+}
+
+impl BitXorAssign for Int128 {
+    #[inline]
+    fn bitxor_assign(&mut self, rhs: Self) {
+        self.0 ^= rhs.0;
+    }
+}
+
+impl BitAnd for Int128 {
+    type Output = Self;
+    #[inline]
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Self(self.0 & rhs.0)
+    }
+}
+
+impl BitOr for Int128 {
+    type Output = Self;
+    #[inline]
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl Not for Int128 {
+    type Output = Self;
+    #[inline]
+    fn not(self) -> Self::Output {
+        Self(!self.0)
     }
 }
 
@@ -258,5 +297,18 @@ mod tests {
         // Test rotation on a specific negative pattern
         let val = Int128::new(1i128 << 127); // Only the sign bit is set
         assert_eq!(val.rotate_right(1), Int128::new(1i128 << 126));
+    }
+
+    #[test]
+    fn test_bitxor() {
+        let a = Int128::new(0b1010);
+        let b = Int128::new(0b1100);
+        assert_eq!(a ^ b, Int128::new(0b0110));
+
+        // Test with negative numbers (all 1s in two's complement)
+        let all_ones = Int128::new(-1);
+        let zero = Int128::new(0);
+        assert_eq!(all_ones ^ zero, Int128::new(-1));
+        assert_eq!(all_ones ^ all_ones, Int128::new(0));
     }
 }
