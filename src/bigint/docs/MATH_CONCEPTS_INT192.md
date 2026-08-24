@@ -144,7 +144,7 @@ For $X = \text{MIN} = -2^{191}$ (`hi = i64::MIN`, `mid = 0`, `lo = 0`):
 This correctly mirrors the two's complement asymmetric range where $-\text{MIN} = \text{MIN}$ due to modular wrap-around, and both carry stages fire "for real" reasons (each addition genuinely overflows), so this edge case does not exercise the §3.3 pitfall.
 
 ### 3.5 Edge Case: $-(-1) = 1$, the Case That Exposed the Bug
-For $X = \text{MINUS\_ONE} = (-1, -1, -1)$ (`hi = mid = lo = -1`, i.e. all limbs are `u64::MAX`):
+For $X = \text{MINUS}\_{\text{ONE}} = (-1, -1, -1)$ (`hi = mid = lo = -1`, i.e. all limbs are `u64::MAX`):
 1. $\text{lo} = (\mathord{\sim}(\text{u64::MAX}) + 1) = (0 + 1) = 1$. Since $\text{lo} \neq 0$, $c\_1 = 0$ — correctly, no carry, because $X\_{\text{lo}} \neq 0$.
 2. $\text{mid} = (\mathord{\sim}(\text{u64::MAX}) + c\_1) = (0 + 0) = 0$. The **correct** carry is $c\_2 = 0$: no overflow occurred, we simply added $0$ to $0$.
    - The buggy `(mid == 0)` heuristic would instead set $c\_2 = 1$ here, since it cannot distinguish "the sum is naturally zero" from "the sum overflowed to zero".
@@ -243,7 +243,7 @@ Let two 192-bit integers be $X = a\_1 \cdot 2^{128} + b\_1 \cdot 2^{64} + c\_1$ 
 
 $$X \cdot Y = \underbrace{a\_1 a\_2}\_{\text{Weight } 2^{256}} + \underbrace{(a\_1 b\_2 + b\_1 a\_2)}\_{\text{Weight } 2^{192}} + \underbrace{(a\_1 c\_2 + b\_1 b\_2 + c\_1 a\_2)}\_{\text{Weight } 2^{128}} + \underbrace{(b\_1 c\_2 + c\_1 b\_2)}\_{\text{Weight } 2^{64}} + \underbrace{c\_1 c\_2}\_{\text{Weight } 2^0}$$
 
-(Each weight-$2^{256}$/$2^{192}$/$2^{128}$/$2^{64}$ group above is implicitly multiplied by that power of two.)
+(Each weight group above — $2^{256}$, $2^{192}$, $2^{128}$, $2^{64}$ — is implicitly multiplied by that power of two.)
 
 ```
                  a1 (hi)          b1 (mid)         c1 (lo)
@@ -271,7 +271,7 @@ Because the output ring is $\mathbb{Z} / 2^{192}\mathbb{Z}$, any term with weigh
 
 2. **Weight-$2^{128}$ Terms $a\_1 c\_2$, $b\_1 b\_2$, $c\_1 a\_2$:** Each is a 64-bit $\times$ 64-bit product landing at base offset $128$, so it spans bits $[128, 255]$. Only bits $[128, 191]$ — i.e. the *low 64 bits* of each product — actually fall inside the 192-bit window; the product's own upper 64 bits land at $[192, 255]$ and are discarded:
    $$p \cdot 2^{128} = \big(p\_{\text{hi}} \cdot 2^{64} + p\_{\text{lo}}\big) \cdot 2^{128} = p\_{\text{hi}} \cdot 2^{192} + p\_{\text{lo}} \cdot 2^{128} \equiv p\_{\text{lo}} \cdot 2^{128} \pmod{2^{192}}$$
-   *Optimization:* Only the lower 64 bits of each of these three products are computed and kept; the code explicitly discards the upper half with `let (_, p\_lo) = mul_u64(...)`.
+   *Optimization:* Only the lower 64 bits of each of these three products are computed and kept; the code explicitly discards the upper half with `let (_, p3_lo) = mul_u64(c1, a2)`.
 
 3. **Weight-$2^{64}$ Terms $b\_1 c\_2$ and $c\_1 b\_2$:** Each spans bits $[64, 191]$ — entirely inside the 192-bit window (worst case $(2^{64}-1)^2 \approx 2^{128}$, which at weight $2^{64}$ reaches at most bit $191$). Both the high and low halves of each product are kept in full.
 
