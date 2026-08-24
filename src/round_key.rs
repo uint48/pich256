@@ -4,9 +4,9 @@ use crate::bigint::int128::Int128;
 // sub_key: Int128: This is the actual 128-bit round key material.
 // rc: i64: This is the Round Constant. Their primary cryptographic purpose is to break symmetry.
 pub struct Roundkey {
-    id: u8,
-    sub_key: Int128,
-    rc: i64,
+    pub id: u8,
+    pub sub_key: Int128,
+    pub rc: i64,
 }
 
 impl Roundkey {
