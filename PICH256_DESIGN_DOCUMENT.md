@@ -163,7 +163,7 @@ flowchart TD
 
 The 16 subkeys are stored in a `Vec<Roundkey>` and consumed round-robin:
 
-$$rk_0 \to rk_1 \to \dots \to rk_{15} \to rk_0 \to \dots \quad(\text{index} = \text{round\_index} \bmod 16)$$
+$$rk_0 \to rk_1 \to \dots \to rk_{15} \to rk_0 \to \dots \quad(\text{index} = \text{round index} \bmod 16)$$
 
 The counter uses `wrapping_add`, so an arbitrarily long stream never panics on overflow.
 
@@ -173,9 +173,9 @@ The counter uses `wrapping_add`, so an arbitrarily long stream never panics on o
 
 Each round evolves the 128-bit state $W$ with three layers: rotational diffusion, non-linear substitution, and round-key XOR:
 
-$$W_{t+1} = \Big(\text{sbox\_transform}\big(W_t \ggg_{128} 7\big)\Big) \oplus rk_{\text{round\_index}\bmod 16}$$
+$$W_{t+1} = f\big(W_t \ggg_{128} 7\big) \oplus rk_{\,i}, \quad i = \text{round index} \bmod 16$$
 
-then $\text{round\_index} \mathrel{+}= 1$.
+where $f$ is the confusion core `sbox_transform` (§4.4). The round index then advances by 1.
 
 ```mermaid
 flowchart LR
@@ -192,7 +192,7 @@ flowchart LR
 
 The non-linear function is a three-stage pipeline:
 
-$$\text{sbox\_transform}(X) = \text{cbox}\Big(\text{sboxes}\big(\text{xbox}(X)\big)\Big)$$
+$$f(X) = \text{cbox}\Big(\text{sboxes}\big(\text{xbox}(X)\big)\Big) \qquad (f = \texttt{sbox transform})$$
 
 ```mermaid
 flowchart TD
@@ -240,8 +240,9 @@ $$\text{cbox}(Y) = (Y_\text{mid} \ll 64)\;|\;Y_\text{lo}$$
 To produce one keystream byte $z_t$:
 
 1. Advance the state **two rounds**: $W \leftarrow \text{round}(\text{round}(W))$.
-2. Take the low nibble of the **little-endian byte 0** as a dynamic index:
-   $$\text{idx} = W_\text{le}[0] \;\&\; \texttt{0x0F} \in [0,15]$$
+2. Take the low nibble of the **little-endian byte 0** as a dynamic index
+   (`W[0] & 0x0F`, equivalently mod 16):
+   $$\text{idx} = W_\text{le}[0] \bmod 16 \in [0,15]$$
 3. Output the state byte at that position:
    $$z_t = W_\text{le}[\text{idx}]$$
 
