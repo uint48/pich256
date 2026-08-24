@@ -389,14 +389,12 @@ Consider $X = 2^{129} - 1 = 2 \cdot 2^{128} + (2^{128}-1)$.
 
 ## 10. Summary of Architectural & Mathematical Theorems
 
-$$\begin{array}{|l|l|l|}
-\hline
-\textbf{Operation} & \textbf{Mathematical Formula} & \textbf{Hardware Translation} \\ \hline
-\text{Negation } (-X) & -X = \sim X + 1 \pmod{2^{256}} & \text{NOT, ADD, ADC / NEG} \\ \hline
-\text{Addition } (A + B) & (A_{\text{hi}} + B_{\text{hi}} + c)\cdot 2^{128} + (A_{\text{lo}} + B_{\text{lo}} \bmod 2^{128}) & \text{ADD, ADC (Carry Flag)} \\ \hline
-\text{Subtraction } (A - B) & (A_{\text{hi}} - B_{\text{hi}} - b)\cdot 2^{128} + (A_{\text{lo}} - B_{\text{lo}} \bmod 2^{128}) & \text{SUB, SBB (Borrow Flag)} \\ \hline
-\text{Multiplication } (A \cdot B) & (bd)_{\text{lo}} + \Big( (bd)_{\text{hi}} + (ad)_{\text{lo}} + (bc)_{\text{lo}} \Big)\cdot 2^{128} & \text{4}\times\text{MULX, ADD, ADC} \\ \hline
-\end{array}$$
+| **Operation** | **Mathematical Formula** | **Hardware Translation** |
+| :--- | :--- | :--- |
+| **Negation** $(-X)$ | $-X = \sim X + 1 \pmod{2^{256}}$ | `NOT, ADD, ADC / NEG` |
+| **Addition** $(A + B)$ | $(A_{\text{hi}} + B_{\text{hi}} + c)\cdot 2^{128} + (A_{\text{lo}} + B_{\text{lo}} \bmod 2^{128})$ | `ADD, ADC (Carry Flag)` |
+| **Subtraction** $(A - B)$ | $(A_{\text{hi}} - B_{\text{hi}} - b)\cdot 2^{128} + (A_{\text{lo}} - B_{\text{lo}} \bmod 2^{128})$ | `SUB, SBB (Borrow Flag)` |
+| **Multiplication** $(A \cdot B)$ | $(bd)_{\text{lo}} + \big( (bd)_{\text{hi}} + (ad)_{\text{lo}} + (bc)_{\text{lo}} \big)\cdot 2^{128}$ | `4×MULX, ADD, ADC` |
 
 1. **Ring Isomorphism:** Unsigned multiplication over modular integer rings $\mathbb{Z}/2^{256}\mathbb{Z}$ is homomorphic to signed two's complement multiplication.
 2. **Branchless Execution:** Carry and borrow propagations evaluate via bitwise arithmetic and condition predicates (`lo == 0`, `overflowing_add`, `overflowing_sub`), eliminating data-dependent branch hazards.
