@@ -125,3 +125,250 @@ impl State {
         &self.sub_keys[round_index % self.sub_keys.len()]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==============================================================================
+    // Pich256: encrypt / decrypt round trips
+    // ==============================================================================
+
+    #[test]
+    fn test_encrypt_decrypt_round_trip() {
+        let msg = b"The quick brown fox jumps over the lazy dog";
+
+        let mut enc = Pich256::new("correct horse battery staple");
+        let ciphertext = enc.encrypt(msg);
+
+        // A fresh instance with the same key must reproduce the same keystream
+        // from the start, so it can recover the original plaintext.
+        let mut dec = Pich256::new("correct horse battery staple");
+        let plaintext = dec.decrypt(&ciphertext);
+
+        assert_eq!(plaintext, msg);
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_round_trip_all_byte_values() {
+        // Cover every possible byte value, including 0x00 and 0xff.
+        let msg: Vec<u8> = (0..=255u8).collect();
+
+        let mut enc = Pich256::new("key");
+        let ciphertext = enc.encrypt(&msg);
+
+        let mut dec = Pich256::new("key");
+        let plaintext = dec.decrypt(&ciphertext);
+
+        assert_eq!(plaintext, msg);
+    }
+
+    #[test]
+    fn test_encrypt_empty_message() {
+        let mut cipher = Pich256::new("key");
+        assert_eq!(cipher.encrypt(&[]), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_decrypt_empty_message() {
+        let mut cipher = Pich256::new("key");
+        assert_eq!(cipher.decrypt(&[]), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_single_byte() {
+        let mut enc = Pich256::new("key");
+        let ct = enc.encrypt(&[0x42]);
+        assert_eq!(ct.len(), 1);
+
+        let mut dec = Pich256::new("key");
+        assert_eq!(dec.decrypt(&ct), vec![0x42]);
+    }
+
+    #[test]
+    fn test_ciphertext_length_matches_plaintext_length() {
+        for len in [0, 1, 5, 16, 17, 100, 1000] {
+            let msg = vec![0xAB; len];
+            let mut cipher = Pich256::new("key");
+            assert_eq!(cipher.encrypt(&msg).len(), len);
+        }
+    }
+
+    #[test]
+    fn test_long_message_round_trip() {
+        // Long enough to wrap around the round-key schedule (16 keys) and
+        // the state's 4-bit byte-selection index many times over.
+        let msg: Vec<u8> = (0..10_000u32).map(|i| (i % 256) as u8).collect();
+
+        let mut enc = Pich256::new("long-message-key");
+        let ciphertext = enc.encrypt(&msg);
+
+        let mut dec = Pich256::new("long-message-key");
+        let plaintext = dec.decrypt(&ciphertext);
+
+        assert_eq!(plaintext, msg);
+    }
+
+    // ==============================================================================
+    // Pich256: keying edge cases
+    // ==============================================================================
+
+    #[test]
+    fn test_empty_base_key_does_not_panic() {
+        // HMAC-SHA256 accepts a zero-length key, so this must still work.
+        let mut cipher = Pich256::new("");
+        assert_eq!(cipher.encrypt(b"data").len(), 4);
+    }
+
+    #[test]
+    fn test_unicode_base_key_round_trips() {
+        let key = "pässwörd🔐密码";
+        let msg = b"unicode key material";
+
+        let mut enc = Pich256::new(key);
+        let ct = enc.encrypt(msg);
+
+        let mut dec = Pich256::new(key);
+        assert_eq!(dec.decrypt(&ct), msg);
+    }
+
+    // ==============================================================================
+    // Pich256: keystream properties
+    // ==============================================================================
+
+    #[test]
+    fn test_encrypt_is_deterministic_for_same_key_and_message() {
+        let msg = b"deterministic";
+
+        let mut a = Pich256::new("same-key");
+        let mut b = Pich256::new("same-key");
+
+        assert_eq!(a.encrypt(msg), b.encrypt(msg));
+    }
+
+    #[test]
+    fn test_different_keys_produce_different_ciphertext() {
+        let msg = b"identical plaintext, different keys";
+
+        let mut a = Pich256::new("key-one");
+        let mut b = Pich256::new("key-two");
+
+        assert_ne!(a.encrypt(msg), b.encrypt(msg));
+    }
+
+    #[test]
+    fn test_ciphertext_differs_from_plaintext() {
+        let msg = vec![0u8; 64];
+        let mut cipher = Pich256::new("key");
+        let ct = cipher.encrypt(&msg);
+
+        // Vanishingly unlikely for 64 keystream bytes to all be zero.
+        assert_ne!(ct, msg);
+    }
+
+    #[test]
+    fn test_repeated_encrypt_calls_advance_the_keystream() {
+        // Encrypting the same plaintext twice on the *same* instance must not
+        // reuse keystream bytes: the internal state advances between calls.
+        let msg = b"repeat me";
+        let mut cipher = Pich256::new("key");
+
+        let first = cipher.encrypt(msg);
+        let second = cipher.encrypt(msg);
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn test_decrypt_with_wrong_key_does_not_recover_plaintext() {
+        let msg = b"top secret message, do not leak";
+
+        let mut enc = Pich256::new("real-key");
+        let ct = enc.encrypt(msg);
+
+        let mut dec = Pich256::new("wrong-key");
+        let recovered = dec.decrypt(&ct);
+
+        assert_ne!(recovered, msg);
+    }
+
+    // ==============================================================================
+    // State: internal round mechanics
+    // ==============================================================================
+
+    #[test]
+    fn test_state_new_runs_warmup_rounds() {
+        let state = State::new(Int128::new(1), Int128::new(2));
+
+        // round() increments round_index via next_rk(), so after the warmup
+        // phase it should sit exactly at WARMUP_ROUNDS.
+        assert_eq!(state.round_index, State::WARMUP_ROUNDS);
+    }
+
+    #[test]
+    fn test_round_mutates_state() {
+        let mut state = State::new(Int128::new(1), Int128::new(2));
+        let before = state.w;
+
+        state.round();
+
+        assert_ne!(state.w, before);
+    }
+
+    #[test]
+    fn test_next_rk_increments_round_index_and_cycles() {
+        let mut state = State::new(Int128::new(1), Int128::new(2));
+        let len = state.sub_keys.len();
+
+        let first_id = state.next_rk().id;
+        assert_eq!(state.round_index, State::WARMUP_ROUNDS + 1);
+
+        // After exactly `len` total calls, the round-robin schedule must
+        // land back on the same round key it started on.
+        for _ in 0..len - 1 {
+            state.next_rk();
+        }
+        let wrapped_id = state.next_rk().id;
+
+        assert_eq!(wrapped_id, first_id);
+    }
+
+    #[test]
+    fn test_get_round_key_wraps_by_modulo() {
+        let state = State::new(Int128::new(1), Int128::new(2));
+        let len = state.sub_keys.len();
+
+        assert_eq!(state.get_round_key(0).id, state.get_round_key(len).id);
+        assert_eq!(state.get_round_key(1).id, state.get_round_key(len + 1).id);
+        assert_eq!(state.get_round_key(0).id, state.get_round_key(len * 3).id);
+    }
+
+    #[test]
+    fn test_next_byte_matches_two_rounds_then_extract() {
+        // next_byte() is documented as: run two rounds, then pull the byte
+        // at the index named by the low nibble of the state's first LE byte.
+        // Mirror that here against an independently constructed state built
+        // from the same key material.
+        let mut state = State::new(Int128::new(1), Int128::new(2));
+        let mut expected = State::new(Int128::new(1), Int128::new(2));
+        expected.round();
+        expected.round();
+
+        let expected_bytes = expected.w.to_le_bytes();
+        let idx = (expected_bytes[0] & 0x0f) as usize;
+        let expected_byte = expected_bytes[idx];
+
+        assert_eq!(state.next_byte(), expected_byte);
+    }
+
+    #[test]
+    fn test_next_byte_many_calls_no_panic() {
+        // Exercises every possible 4-bit index (0..=15) over enough calls,
+        // and confirms the round counter can advance far past the sub-key
+        // schedule length without issue.
+        let mut state = State::new(Int128::new(42), Int128::new(1337));
+        for _ in 0..10_000 {
+            let _ = state.next_byte();
+        }
+    }
+}
