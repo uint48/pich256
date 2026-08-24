@@ -59,6 +59,23 @@ impl I192 {
             self.0[0]
         }
     }
+
+    /// Converts the integer to a 24-byte array in big-endian order.
+    pub fn to_be_bytes(self) -> [u8; 24] {
+        let mut bytes = [0u8; 24];
+        bytes[0..8].copy_from_slice(&self.hi().to_be_bytes());
+        bytes[8..16].copy_from_slice(&self.mid().to_be_bytes());
+        bytes[16..24].copy_from_slice(&self.lo().to_be_bytes());
+        bytes
+    }
+
+    /// Creates a new integer from a 24-byte array in big-endian order.
+    pub fn from_be_bytes(bytes: [u8; 24]) -> Self {
+        let hi = i64::from_be_bytes(bytes[0..8].try_into().unwrap());
+        let mid = i64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        let lo = i64::from_be_bytes(bytes[16..24].try_into().unwrap());
+        Self::new(hi, mid, lo)
+    }
 }
 
 impl Add for I192 {
