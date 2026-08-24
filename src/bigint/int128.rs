@@ -63,6 +63,18 @@ impl Int128 {
     pub fn from_be_bytes(bytes: [u8; 16]) -> Self {
         Self(i128::from_be_bytes(bytes))
     }
+
+    /// Converts the integer to a 16-byte array in little-endian order.
+    #[inline]
+    pub fn to_le_bytes(self) -> [u8; 16] {
+        self.0.to_le_bytes()
+    }
+
+    /// Creates a new integer from a 16-byte array in little-endian order.
+    #[inline]
+    pub fn from_le_bytes(bytes: [u8; 16]) -> Self {
+        Self(i128::from_le_bytes(bytes))
+    }
 }
 
 impl Add for Int128 {
@@ -195,6 +207,12 @@ mod tests {
         assert_eq!(be_bytes[0], 0x01, "BE first byte should be 0x01");
         assert_eq!(be_bytes[15], 0x10, "BE last byte should be 0x10");
         assert_eq!(Int128::from_be_bytes(be_bytes), val, "BE round-trip failed");
+
+        // Test Little-Endian
+        let le_bytes = val.to_le_bytes();
+        assert_eq!(le_bytes[0], 0x10, "LE first byte should be 0x10");
+        assert_eq!(le_bytes[15], 0x01, "LE last byte should be 0x01");
+        assert_eq!(Int128::from_le_bytes(le_bytes), val, "LE round-trip failed");
     }
 
     #[test]
