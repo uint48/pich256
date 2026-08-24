@@ -4,7 +4,7 @@ use crate::key_gen::gen_sub_keys;
 use crate::round_key::Roundkey;
 use crate::sbox::sbox_transform;
 
-struct Pich256{
+pub struct Pich256{
     st: State
 }
 

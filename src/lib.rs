@@ -2,7 +2,7 @@
 #![allow(unused_assignments)]
 
 mod bigint;
-mod pich256;
+pub mod pich256;
 mod sbox;
 mod kdf;
 mod rc;
