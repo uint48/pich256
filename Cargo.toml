@@ -1,5 +1,5 @@
 [package]
-name = "pich128"
+name = "pich256"
 version = "0.1.0"
 edition = "2024"
 
