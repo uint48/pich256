@@ -22,15 +22,20 @@ impl Pich256 {
     }
     #[inline]
     pub fn encrypt(&mut self, msg: &[u8]) -> Vec<u8> {
-        let ciphertext = Vec::with_capacity(msg.len());
-        // TODO
+        let mut ciphertext = Vec::with_capacity(msg.len());
+        for &byte in msg {
+            // XOR each plaintext byte with the next keystream byte
+            ciphertext.push(byte ^ self.st.next_byte());
+        }
         ciphertext
     }
 
     #[inline]
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Vec<u8> {
-        let plaintext = Vec::with_capacity(ciphertext.len());
-        // TODO
+        let mut plaintext = Vec::with_capacity(ciphertext.len());
+        for &byte in ciphertext {
+            plaintext.push(byte ^ self.st.next_byte());
+        }
         plaintext
     }
 }
@@ -94,6 +99,24 @@ impl State {
         self.w = sbox_transform(self.w);
         // Key Mixing (XOR)
         self.w = self.w ^ sub_key;
+    }
+
+    // Keystream generator, produce a single, pseudo-random byte that will be XORed with
+    // your plaintext (to encrypt) or ciphertext (to decrypt)
+    #[inline]
+    pub fn next_byte(&mut self) -> u8 {
+        // This guarantees that the byte you are about to extract
+        // is thoroughly mixed and unpredictable.
+        self.round();
+        self.round();
+
+        let w_bytes = self.w.to_le_bytes();
+
+        // The result of anything & 0x0f is guaranteed to be a number between 0 and 15.
+        // Since our state byte array has exactly 16 elements
+        let idx = (w_bytes[0] & 0x0f) as usize;
+
+        w_bytes[idx]
     }
 
 

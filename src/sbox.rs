@@ -38,7 +38,7 @@ pub fn cbox(input: I192) -> Int128 {
 /// Applies S-box substitution to a single byte
 #[inline]
 pub fn sbox(byte: u8) -> u8 {
-    //TODO implement
+    // TODO
     byte
 }
 
