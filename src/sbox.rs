@@ -1,10 +1,10 @@
-use crate::bigint::int128::Int128;
+use crate::bigint::int128::I128;
 use crate::bigint::int192::I192;
 
 /// Composition function: sbox_transform(input) = cbox(sboxes(xbox(input)))
 /// Expands 128→192, applies S-box substitution, then compresses 192→128
 #[inline]
-pub fn sbox_transform(input: Int128) -> Int128 {
+pub fn sbox_transform(input: I128) -> I128 {
     let expanded = xbox(input);        // 128 → 192 bits
     let substituted = sboxes(expanded); // Apply S-box to all bytes
     let compressed = cbox(substituted); // 192 → 128 bits
@@ -13,7 +13,7 @@ pub fn sbox_transform(input: Int128) -> Int128 {
 
 /// Zero-extends a 128-bit integer to 192 bits
 #[inline]
-pub fn xbox(input: Int128) -> I192 {
+pub fn xbox(input: I128) -> I192 {
     let hi_128 = input.hi();
     let lo_128 = input.lo();
 
@@ -24,7 +24,7 @@ pub fn xbox(input: Int128) -> I192 {
 /// Compresses a 192-bit integer to 128 bits
 /// Masks the input to keep only the lower 128 bits
 #[inline]
-pub fn cbox(input: I192) -> Int128 {
+pub fn cbox(input: I192) -> I128 {
     let mid = input.mid() as i128;
     // Cast to u64 first to prevent sign-extension when converting to i128
     let lo = (input.lo() as u64) as i128;
@@ -32,7 +32,7 @@ pub fn cbox(input: I192) -> Int128 {
     // Combine into a single 128-bit integer
     let combined = (mid << 64) | lo;
 
-    Int128::new(combined)
+    I128::new(combined)
 }
 
 /// The Rijndael (AES) S-box: a fixed, bijective byte substitution table.
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn test_xbox_zero_extends() {
-        let input = Int128::new(-1); // all bits set
+        let input = I128::new(-1); // all bits set
         let expanded = xbox(input);
 
         // Upper 64 bits of the 192-bit value must be zero.
@@ -159,14 +159,14 @@ mod tests {
         let b = I192::new(-9999, 10, 20);
 
         assert_eq!(cbox(a), cbox(b));
-        assert_eq!(cbox(a), Int128::new((10i128 << 64) | 20u64 as i128));
+        assert_eq!(cbox(a), I128::new((10i128 << 64) | 20u64 as i128));
     }
 
     #[test]
     fn test_xbox_cbox_round_trip_is_identity() {
         // Since xbox zero-extends and cbox drops exactly that extension,
         // composing them (without the S-box step) should recover the input.
-        let input = Int128::new(0x0123456789ABCDEF_FEDCBA9876543210u128 as i128);
+        let input = I128::new(0x0123456789ABCDEF_FEDCBA9876543210u128 as i128);
         assert_eq!(cbox(xbox(input)), input);
     }
 
@@ -180,13 +180,13 @@ mod tests {
         // the 16 big-endian bytes of the 128-bit input independently: the
         // zero-extended high 64 bits get substituted too but are discarded
         // by cbox before they can affect the result.
-        let input = Int128::new(0x00112233445566778899AABBCCDDEEFFu128 as i128);
+        let input = I128::new(0x00112233445566778899AABBCCDDEEFFu128 as i128);
 
         let mut expected_bytes = input.to_be_bytes();
         for b in expected_bytes.iter_mut() {
             *b = sbox(*b);
         }
-        let expected = Int128::from_be_bytes(expected_bytes);
+        let expected = I128::from_be_bytes(expected_bytes);
 
         assert_eq!(sbox_transform(input), expected);
     }
@@ -194,13 +194,13 @@ mod tests {
     #[test]
     fn test_sbox_transform_zero() {
         // Every byte of a zero input substitutes to 0x63.
-        let expected = Int128::from_be_bytes([0x63; 16]);
-        assert_eq!(sbox_transform(Int128::ZERO), expected);
+        let expected = I128::from_be_bytes([0x63; 16]);
+        assert_eq!(sbox_transform(I128::ZERO), expected);
     }
 
     #[test]
     fn test_sbox_transform_deterministic() {
-        let input = Int128::new(0x2f34e5ff91ec85d5_3ca9b5436831744du128 as i128);
+        let input = I128::new(0x2f34e5ff91ec85d5_3ca9b5436831744du128 as i128);
         assert_eq!(sbox_transform(input), sbox_transform(input));
     }
 }

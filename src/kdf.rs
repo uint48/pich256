@@ -2,7 +2,7 @@
 // 256-bit Key Derivation
 // ==============================================================================
 
-use crate::bigint::int128::Int128;
+use crate::bigint::int128::I128;
 use crate::bigint::int256::I256;
 use crate::sha256::hmac_sha256;
 
@@ -19,10 +19,10 @@ pub fn derive_256bit_key(key: &[u8]) -> I256 {
     I256::new(hi, lo)
 }
 
-pub fn split_key_into_128bit_limbs(key: &I256) -> (Int128, Int128) {
+pub fn split_key_into_128bit_limbs(key: &I256) -> (I128, I128) {
     (
-        Int128::new(key.hi()),
-        Int128::new(key.lo()),
+        I128::new(key.hi()),
+        I128::new(key.lo()),
     )
 }
 
@@ -92,7 +92,7 @@ mod tests {
         // to represent the first half (index 0..16) and second half (index 16..32) respectively.
         let (lower, higher) = split_key_into_128bit_limbs(&key);
 
-        assert_eq!(lower, Int128::new(hi_val));
-        assert_eq!(higher, Int128::new(lo_val));
+        assert_eq!(lower, I128::new(hi_val));
+        assert_eq!(higher, I128::new(lo_val));
     }
 }

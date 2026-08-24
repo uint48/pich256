@@ -1,4 +1,4 @@
-use crate::bigint::int128::Int128;
+use crate::bigint::int128::I128;
 use crate::kdf::{derive_256bit_key, split_key_into_128bit_limbs};
 use crate::key_gen::gen_sub_keys;
 use crate::round_key::Roundkey;
@@ -45,7 +45,7 @@ impl Pich256 {
 // the cipher will mathematically mix this state,
 // sub_keys: This holds the linked list of Roundkeys simply implemented using Vec
 struct State{
-    w: Int128,
+    w: I128,
     sub_keys: Vec<Roundkey>,
     round_index: usize,
 }
@@ -55,7 +55,7 @@ impl State {
     const WARMUP_ROUNDS: usize = 62;
     // ke: key expansion seed -> low limb of key
     // w: initial state vector (w0) -> high limb of key
-    pub fn new(w: Int128, ke: Int128) -> Self {
+    pub fn new(w: I128, ke: I128) -> Self {
         let mut state = Self {
             w,
             sub_keys: gen_sub_keys(ke),
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_state_new_runs_warmup_rounds() {
-        let state = State::new(Int128::new(1), Int128::new(2));
+        let state = State::new(I128::new(1), I128::new(2));
 
         // round() increments round_index via next_rk(), so after the warmup
         // phase it should sit exactly at WARMUP_ROUNDS.
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_round_mutates_state() {
-        let mut state = State::new(Int128::new(1), Int128::new(2));
+        let mut state = State::new(I128::new(1), I128::new(2));
         let before = state.w;
 
         state.round();
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn test_next_rk_increments_round_index_and_cycles() {
-        let mut state = State::new(Int128::new(1), Int128::new(2));
+        let mut state = State::new(I128::new(1), I128::new(2));
         let len = state.sub_keys.len();
 
         let first_id = state.next_rk().id;
@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn test_get_round_key_wraps_by_modulo() {
-        let state = State::new(Int128::new(1), Int128::new(2));
+        let state = State::new(I128::new(1), I128::new(2));
         let len = state.sub_keys.len();
 
         assert_eq!(state.get_round_key(0).id, state.get_round_key(len).id);
@@ -349,8 +349,8 @@ mod tests {
         // at the index named by the low nibble of the state's first LE byte.
         // Mirror that here against an independently constructed state built
         // from the same key material.
-        let mut state = State::new(Int128::new(1), Int128::new(2));
-        let mut expected = State::new(Int128::new(1), Int128::new(2));
+        let mut state = State::new(I128::new(1), I128::new(2));
+        let mut expected = State::new(I128::new(1), I128::new(2));
         expected.round();
         expected.round();
 
@@ -366,7 +366,7 @@ mod tests {
         // Exercises every possible 4-bit index (0..=15) over enough calls,
         // and confirms the round counter can advance far past the sub-key
         // schedule length without issue.
-        let mut state = State::new(Int128::new(42), Int128::new(1337));
+        let mut state = State::new(I128::new(42), I128::new(1337));
         for _ in 0..10_000 {
             let _ = state.next_byte();
         }

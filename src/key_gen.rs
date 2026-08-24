@@ -1,10 +1,10 @@
-use crate::bigint::int128::Int128;
+use crate::bigint::int128::I128;
 use crate::rc::{p, RCS};
 use crate::round_key::Roundkey;
 use crate::sbox::sbox;
 
 /// Generates the 16 round keys for the cipher.
-pub fn gen_sub_keys(ke: Int128) -> Vec<Roundkey> {
+pub fn gen_sub_keys(ke: I128) -> Vec<Roundkey> {
     let mut keys = Vec::with_capacity(16);
 
     let first_rc = RCS[0] as i64;
@@ -25,12 +25,12 @@ pub fn gen_sub_keys(ke: Int128) -> Vec<Roundkey> {
 // key mixing function that generates the next subkey
 // Subkey Generator Function
 #[inline]
-pub fn g(x: Int128, rc: i64) -> Int128 {
+pub fn g(x: I128, rc: i64) -> I128 {
     // y = rotl(x, 7);
     let mut y = x.rotate_left(7);
 
     // y = y * rc;
-    y = y * Int128::new(rc as i128);
+    y = y * I128::new(rc as i128);
 
     // y = rotr(y, 4);
     y = y.rotate_right(4);
@@ -41,7 +41,7 @@ pub fn g(x: Int128, rc: i64) -> Int128 {
     // Apply the S-box to the byte at offset 14
     bytes[14] = sbox(bytes[14]);
 
-    y = Int128::from_le_bytes(bytes);
+    y = I128::from_le_bytes(bytes);
 
     // y = rotl(y, 4);
     y = y.rotate_left(4);
