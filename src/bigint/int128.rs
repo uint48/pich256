@@ -39,6 +39,18 @@ impl Int128 {
     pub const fn hi(&self) -> i64 {
         (self.0 >> 64) as i64
     }
+
+    /// Converts the integer to a 16-byte array in big-endian order.
+    #[inline]
+    pub fn to_be_bytes(self) -> [u8; 16] {
+        self.0.to_be_bytes()
+    }
+
+    /// Creates a new integer from a 16-byte array in big-endian order.
+    #[inline]
+    pub fn from_be_bytes(bytes: [u8; 16]) -> Self {
+        Self(i128::from_be_bytes(bytes))
+    }
 }
 
 impl Add for Int128 {
@@ -159,5 +171,17 @@ mod tests {
         // Wrapping neg: negating i128::MIN wraps back to i128::MIN
         let min = Int128::new(i128::MIN);
         assert_eq!(-min, Int128::new(i128::MIN));
+    }
+
+    #[test]
+    fn test_byte_serialization() {
+        // A value with distinct, recognizable bytes in both halves
+        let val = Int128::new(0x0123456789ABCDEF_FEDCBA9876543210i128);
+
+        // Test Big-Endian
+        let be_bytes = val.to_be_bytes();
+        assert_eq!(be_bytes[0], 0x01, "BE first byte should be 0x01");
+        assert_eq!(be_bytes[15], 0x10, "BE last byte should be 0x10");
+        assert_eq!(Int128::from_be_bytes(be_bytes), val, "BE round-trip failed");
     }
 }
