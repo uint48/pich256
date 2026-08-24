@@ -1,7 +1,39 @@
 use crate::bigint::int128::Int128;
+use crate::kdf::{derive_256bit_key, split_key_into_128bit_limbs};
 use crate::key_gen::gen_sub_keys;
 use crate::round_key::Roundkey;
 use crate::sbox::sbox_transform;
+
+struct Pich256{
+    st: State
+}
+
+impl Pich256 {
+    pub fn new(base_key: &str) -> Self{
+        // Convert the string to a byte slice and derive the 256-bit key
+        let derived_key = derive_256bit_key(base_key.as_bytes());
+
+        // Split the I256 key into two Int128 limbs
+        let (key_hi, key_lo) = split_key_into_128bit_limbs(&derived_key);
+
+        Self {
+            st: State::new(key_hi, key_lo),
+        }
+    }
+    #[inline]
+    pub fn encrypt(&mut self, msg: &[u8]) -> Vec<u8> {
+        let ciphertext = Vec::with_capacity(msg.len());
+        // TODO
+        ciphertext
+    }
+
+    #[inline]
+    pub fn decrypt(&mut self, ciphertext: &[u8]) -> Vec<u8> {
+        let plaintext = Vec::with_capacity(ciphertext.len());
+        // TODO
+        plaintext
+    }
+}
 
 // w: Int128: This is the 128-bit internal state (16 bytes).
 // In a stream cipher, this state is continuously updated. To generate the keystream,
