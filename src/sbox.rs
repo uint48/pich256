@@ -1,6 +1,16 @@
 use crate::bigint::int128::Int128;
 use crate::bigint::int192::I192;
 
+/// Composition function: sbox_transform(input) = cbox(sboxes(xbox(input)))
+/// Expands 128→192, applies S-box substitution, then compresses 192→128
+#[inline]
+pub fn sbox_transform(input: Int128) -> Int128 {
+    let expanded = xbox(input);        // 128 → 192 bits
+    let substituted = sboxes(expanded); // Apply S-box to all bytes
+    let compressed = cbox(substituted); // 192 → 128 bits
+    compressed
+}
+
 /// Zero-extends a 128-bit integer to 192 bits
 #[inline]
 pub fn xbox(input: Int128) -> I192 {
