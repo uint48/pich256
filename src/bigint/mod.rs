@@ -1,2 +1,3 @@
-mod int256;
-mod int128;
+pub mod int256;
+pub mod int128;
+pub mod int192;
