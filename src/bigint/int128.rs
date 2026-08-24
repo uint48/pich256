@@ -40,6 +40,18 @@ impl Int128 {
         (self.0 >> 64) as i64
     }
 
+    /// Shifts the bits to the left by a specified amount, `n`,
+    #[inline]
+    pub const fn rotate_left(self, n: u32) -> Self {
+        Self(self.0.rotate_left(n))
+    }
+
+    /// Shifts the bits to the right by a specified amount, `n`,
+    #[inline]
+    pub const fn rotate_right(self, n: u32) -> Self {
+        Self(self.0.rotate_right(n))
+    }
+
     /// Converts the integer to a 16-byte array in big-endian order.
     #[inline]
     pub fn to_be_bytes(self) -> [u8; 16] {
@@ -183,5 +195,50 @@ mod tests {
         assert_eq!(be_bytes[0], 0x01, "BE first byte should be 0x01");
         assert_eq!(be_bytes[15], 0x10, "BE last byte should be 0x10");
         assert_eq!(Int128::from_be_bytes(be_bytes), val, "BE round-trip failed");
+    }
+
+    #[test]
+    fn test_rotate_left() {
+        let val = Int128::new(1);
+
+        // Basic rotation
+        assert_eq!(val.rotate_left(1), Int128::new(2));
+        assert_eq!(val.rotate_left(2), Int128::new(4));
+
+        // Full rotation wraps around to the original value
+        assert_eq!(val.rotate_left(128), Int128::new(1));
+        assert_eq!(val.rotate_left(129), Int128::new(2));
+
+        // Rotating the sign bit (bit 127) to the least significant bit
+        let high_bit = Int128::new(1i128 << 127);
+        assert_eq!(high_bit.rotate_left(1), Int128::new(1));
+    }
+
+    #[test]
+    fn test_rotate_right() {
+        let val = Int128::new(2);
+
+        // Basic rotation
+        assert_eq!(val.rotate_right(1), Int128::new(1));
+
+        // Full rotation wraps around to the original value
+        assert_eq!(val.rotate_right(128), Int128::new(2));
+        assert_eq!(val.rotate_right(129), Int128::new(1));
+
+        // Rotating the least significant bit to the sign bit (bit 127)
+        let low_bit = Int128::new(1);
+        assert_eq!(low_bit.rotate_right(1), Int128::new(1i128 << 127));
+    }
+
+    #[test]
+    fn test_rotate_negative() {
+        // -1 is all 1s in two's complement, so rotation should not change it
+        let all_ones = Int128::new(-1);
+        assert_eq!(all_ones.rotate_left(42), Int128::new(-1));
+        assert_eq!(all_ones.rotate_right(42), Int128::new(-1));
+
+        // Test rotation on a specific negative pattern
+        let val = Int128::new(1i128 << 127); // Only the sign bit is set
+        assert_eq!(val.rotate_right(1), Int128::new(1i128 << 126));
     }
 }
