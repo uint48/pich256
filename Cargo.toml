@@ -5,6 +5,16 @@ edition = "2024"
 
 [dependencies]
 
+# Benchmarks only. Criterion is a dev-dependency, so it never reaches anything
+# that depends on this crate - the library itself stays dependency-free.
+# `default-features = false` keeps the tree small; enable them for HTML reports.
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "pich256"
+harness = false
+
 [features]
 default = ["simd", "asm"]
 

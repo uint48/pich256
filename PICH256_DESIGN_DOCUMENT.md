@@ -439,12 +439,27 @@ The crate ships an extensive in-tree test suite validating every layer:
 - **Big-ints** — `I128`/`I192`/`I256` arithmetic, rotations, sign handling, and byte round-trips.
 - **S-box** — known Rijndael entries, bijectivity, no fixed/complement points; `sbox_transform` proven equivalent to a byte-wise S-box; `xbox`/`cbox` round-trip identity.
 - **Cipher** — encrypt/decrypt round trips (empty, single byte, all 256 byte values, 10 000-byte streams), determinism, key sensitivity (wrong key ≠ recovery, one-char key change → different ciphertext), keystream advancement, and internal round mechanics (warm-up count, round-key cycling, two-rounds-then-tap emission).
+- **Architecture backends** — every primitive (`sub_bytes`, `round128`, `fill_keystream`, `rotl128`/`rotr128`, `mul128`, `xor_into`, `sha256_compress`) is checked against the portable reference *once per backend the host CPU can execute*, so a single `cargo test` covers the AES-NI, GFNI, AVX2, SSSE3, SSE2 and portable paths. Backend selection is process-global, so those tests serialise behind a shared lock.
+- **AES hardware identities** — `aesenclast(InvShiftRows(x), k) = SubBytes(x) ⊕ k` and the GFNI matrix/constant pair are checked against the S-box table for all 256 byte values in *every one of the 16 lane positions*, because a wrong `InvShiftRows` mask still yields a permutation of the correct bytes.
 
 ```bash
 cargo test
 ```
 
-- **Architecture backends** — every primitive (`sub_bytes`, `round128`, `fill_keystream`, `rotl128`/`rotr128`, `mul128`, `xor_into`, `sha256_compress`) is checked against the portable reference *once per backend the host CPU can execute*, so a single `cargo test` on an AVX2 machine covers the AVX2, SSSE3, SSE2 and portable paths. Backend selection is process-global, so those tests serialise behind a shared lock.
+### Benchmarks
+
+Criterion benchmarks live in `benches/pich256.rs`, parameterised over every
+backend the host supports (§11.7):
+
+```bash
+cargo bench                        # everything
+cargo bench -- encrypt             # one group
+cargo bench -- --save-baseline main # record a baseline
+cargo bench -- --baseline main      # compare against it
+```
+
+The suite asserts every backend still agrees with the portable reference before
+timing anything, so a regression cannot quietly turn into a "speedup".
 
 ---
 
@@ -473,6 +488,41 @@ against.
 | `Sse2` | x86_64 baseline | scalar table lookup, vector XOR |
 | `Fallback` | anything | plain Rust |
 
+```mermaid
+flowchart TD
+    Call["First call into arch::*"] --> Cached{"Already probed?"}
+    Cached -->|"yes"| Use["Relaxed atomic load of the cached backend"]
+    Cached -->|"no"| X86{"target_arch = x86_64<br/>and feature simd?"}
+    X86 -->|"no"| FB["Fallback<br/>plain Rust"]
+    X86 -->|"yes"| AES{"aes + ssse3?"}
+
+    AES -->|"yes"| BAES["AesNi<br/>pshufb + aesenclast"]
+    AES -->|"no"| GF{"gfni?"}
+    GF -->|"yes"| BGF["Gfni<br/>gf2p8affineinv"]
+    GF -->|"no"| V512{"avx512f + bw + vl + vbmi?"}
+    V512 -->|"yes"| B512["Avx512Vbmi<br/>2x vpermi2b"]
+    V512 -->|"no"| V2{"avx2?"}
+    V2 -->|"yes"| BAVX["Avx2<br/>8x vpshufb"]
+    V2 -->|"no"| S3{"ssse3?"}
+    S3 -->|"yes"| BS3["Ssse3<br/>16x pshufb"]
+    S3 -->|"no"| BS2["Sse2<br/>scalar table, baseline"]
+
+    BAES --> Store["Cache in AtomicU8"]
+    BGF --> Store
+    B512 --> Store
+    BAVX --> Store
+    BS3 --> Store
+    BS2 --> Store
+    FB --> Store
+    Store --> Use
+```
+
+SHA-NI sits outside this ladder: the SHA extensions are an independent CPUID
+bit, so `arch::has_sha_ni` probes and caches them separately. A CPU may have
+AVX-512 and no SHA-NI, or SSSE3 and SHA-NI. The same applies to the vector width
+used by the bulk keystream XOR, which asks `arch::has_avx2` directly rather than
+reading a width off the S-box backend.
+
 ### 11.2 The S-box on AES hardware
 
 §4.4 establishes that Pich256's confusion core reduces to a byte-wise Rijndael
@@ -489,6 +539,24 @@ permuting the input first:
 
 $$\texttt{aesenclast}(\text{InvShiftRows}(x), k) = \text{SubBytes}(x) \oplus k$$
 
+```mermaid
+flowchart LR
+    In["state x"] --> ISR["InvShiftRows<br/>1x pshufb"]
+    ISR --> SR
+
+    subgraph AESENCLAST["aesenclast(y, k) — one instruction"]
+        direction LR
+        SR["ShiftRows"] --> SB["SubBytes"]
+        SB --> XK["XOR round key k"]
+    end
+
+    XK --> Out["SubBytes(x) XOR k<br/>the entire round after the rotate"]
+```
+
+The two `ShiftRows` annihilate, and the key XOR the cipher needed anyway is
+already inside the instruction — so the round's substitution *and* its key
+mixing cost one `pshufb` plus one `aesenclast`.
+
 $\text{InvShiftRows}$ is a single `pshufb` with the gather mask
 $[0,13,10,7,\;4,1,14,11,\;8,5,2,15,\;12,9,6,3]$, derived by inverting
 $\text{ShiftRows}(x)[r+4c] = x[r + 4((c+r) \bmod 4)]$.
@@ -503,6 +571,29 @@ affine map $A\cdot\mathrm{inv}(x) + b$ over $\mathrm{GF}(2)$ — the textbook
 definition of the Rijndael S-box (§4.4). With $A$ = the Rijndael matrix
 (`0xF1E3C78F1F3E7CF8` packed per 64-bit lane) and $b = \texttt{0x63}$, the
 substitution is one instruction, with the key XOR as a separate `pxor`.
+
+Laid side by side, one Pich256 round costs:
+
+```mermaid
+flowchart TD
+    subgraph AESNI["AesNi"]
+        direction TB
+        A1["rotr7<br/>psrlq + psllq + pshufd + por"] --> A2["pshufb<br/>InvShiftRows"]
+        A2 --> A3["aesenclast<br/>S-box AND key XOR"]
+    end
+
+    subgraph GFNI["Gfni"]
+        direction TB
+        G1["rotr7<br/>psrlq + psllq + pshufd + por"] --> G2["gf2p8affineinv<br/>S-box"]
+        G2 --> G3["pxor<br/>key"]
+    end
+
+    subgraph SSSE3["Ssse3 — no AES hardware"]
+        direction TB
+        S1["rotr7<br/>psrlq + psllq + pshufd + por"] --> S2["16x (psubb, paddusb, pshufb)<br/>plus a 4-deep OR tree"]
+        S2 --> S3["pxor<br/>key"]
+    end
+```
 
 Both identities and both constants are validated against the 256-entry table in
 every one of the 16 lane positions. This matters: a wrong `InvShiftRows` mask
@@ -527,6 +618,25 @@ The unsigned *saturating* add is essential: a wrapping add would let
 $\text{idx}_r \in [\texttt{0x90}, \texttt{0xff}]$ fold back below `0x80` and
 produce a false hit. Exactly one row is non-zero for any byte, so OR-ing the 16
 shuffles reconstructs the full lookup.
+
+Worked through for a single input byte $x = \texttt{0x2A}$ (row 2, column 10):
+
+```
+ r   idx_r = x - 16r   sel_r = sat_add_u8(idx_r, 0x70)   pshufb(row_r, sel_r)
+───────────────────────────────────────────────────────────────────────────────
+ 0        0x2A            0x9A   bit 7 set                      0x00
+ 1        0x1A            0x8A   bit 7 set                      0x00
+ 2        0x0A            0x7A   bit 7 CLEAR  ────────────▶  SBOX[0x2A]   ◀── hit
+ 3        0xFA  wrapped    0xFF   saturated                     0x00
+ …          …               …                                    …
+15        0x3A  wrapped    0xAA   bit 7 set                      0x00
+───────────────────────────────────────────────────────────────────────────────
+                                          OR of all 16  =  SBOX[0x2A]
+```
+
+Row 3 is the case the saturation exists for: `0xFA + 0x70` is `0x16A`, which a
+wrapping add would truncate to `0x6A` — bit 7 clear, a false hit on row 3's
+tenth entry. Saturating at `0xFF` keeps it zeroed.
 
 Two structural refinements matter more than the instruction count:
 
@@ -558,6 +668,24 @@ single normative definition of the keystream — is instantiated *inside* each
 backend's target-feature boundary so the round body inlines and the state stays
 in a register. Doing this alone cut end-to-end time from 15.3 to 13.2 ns/byte.
 
+```mermaid
+flowchart TD
+    subgraph BAD["Rejected: dispatch per round"]
+        direction TB
+        L1["keystream loop<br/>no target features"] --> M1["match on Backend"]
+        M1 --> C1["call round128_aesni"]
+        C1 --> N1["cannot inline: caller lacks aes<br/>state spills to memory and back<br/>twice per output byte"]
+        N1 --> L1
+    end
+
+    subgraph GOOD["Shipped: dispatch per buffer"]
+        direction TB
+        F["arch::fill_keystream<br/>one match on Backend"] --> W["fill_keystream_aesni<br/>target_feature boundary"]
+        W --> KC["keystream_core inlined here"]
+        KC --> R["round body inlines too<br/>state stays in XMM for the whole buffer"]
+    end
+```
+
 The AVX2 path goes one step further and holds the state lane-duplicated across
 the entire buffer, so the fold and re-broadcast around the paired-row S-box
 collapse into a single `vperm2i128` + `vpor`.
@@ -587,33 +715,93 @@ measures slower than the scalar table.
 
 ### 11.7 Measured results
 
-`cargo run --release --example arch_bench`, on a CPU with AES-NI, GFNI, AVX2 and
-SHA-NI. Mean of five runs; run-to-run spread is a few percent, so treat the
-ratios rather than the absolute figures as the result:
+Criterion, 50 samples per point, on a CPU with AES-NI, GFNI, AVX2 and SHA-NI:
 
-| Workload | AES-NI | GFNI | AVX2 | SSSE3 | SSE2 | Portable |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `sub_bytes`, 64 KiB | **0.026** | 0.025 | 0.246 | 0.273 | 0.160 | 0.158 ns/byte |
-| `round128` | **3.10** | 3.24 | 6.88 | 8.48 | 5.68 | 5.63 ns/round |
-| `Pich256::encrypt` | **3.88** | 4.11 | 10.11 | 13.72 | 10.75 | 10.96 ns/byte |
-| `sha256_compress` | **0.43** (SHA-NI) | — | — | — | — | 2.76 ns/byte |
+```bash
+cargo bench
+```
 
-The cipher runs ~2.8× faster on AES hardware and bulk substitution ~6×; SHA-256
-gains ~6× from SHA-NI. Without AES hardware the picture is far flatter — the AVX2
-path wins the latency-bound inner loop by ~7% and the SSSE3 path loses to the
-scalar table outright — because a 256-entry byte substitution is close to the
-worst case for SIMD, and because the cipher's two full-state rounds per output
-byte form a serial dependency chain that no amount of width can shorten.
+**Cipher throughput.** `encrypt` at 64 KiB, and `keystream` (generation alone, no
+allocation, no plaintext XOR) at 4 KiB — the two agree closely, which confirms
+keystream generation is where essentially all the time goes:
 
-AES-NI edges out GFNI on the *round* despite needing two instructions to GFNI's
-one, because `aesenclast` also performs the round's key XOR; on bulk `sub_bytes`,
-where there is no key to fold, the two are level. Every CPU with GFNI also has
-AES-NI, so the detector prefers AES-NI and GFNI is reachable through
-`arch::force_backend`.
+| Backend | `encrypt` | `keystream` | `round128` |
+| :--- | ---: | ---: | ---: |
+| `AesNi` | **259.6 MiB/s** | **259.3 MiB/s** | **2.98 ns** |
+| `Gfni` | 240.6 MiB/s | 241.8 MiB/s | 3.18 ns |
+| `Avx2` | 98.9 MiB/s | 97.3 MiB/s | 6.60 ns |
+| `Sse2` | 91.5 MiB/s | 91.9 MiB/s | 5.05 ns |
+| `Fallback` | 91.3 MiB/s | 92.0 MiB/s | 5.04 ns |
+| `Ssse3` | 72.6 MiB/s | 72.6 MiB/s | 7.52 ns |
 
-Note the standalone `round128` row is dispatched *per call* and so pays the
-non-inlinable call described in §11.4; the end-to-end row is the one that
-reflects real use.
+```mermaid
+xychart-beta
+    title "Keystream throughput, MiB/s (higher is better)"
+    x-axis ["AesNi", "Gfni", "Avx2", "Sse2", "Fallback", "Ssse3"]
+    y-axis "MiB/s" 0 --> 280
+    bar [259.3, 241.8, 97.3, 91.9, 92.0, 72.6]
+```
+
+**AES hardware gives ~2.8x end to end.** Without it the spread is small and not
+uniformly favourable: `Avx2` beats the scalar table by ~7%, and `Ssse3` *loses*
+to it by 21%. Those backends are retained for their constant-time property
+(§11.6), not their speed.
+
+**Bulk substitution**, `arch::sub_bytes` over an L1-resident 4 KiB buffer, is
+where the AES instructions show their real margin:
+
+| Backend | Throughput | vs portable |
+| :--- | ---: | ---: |
+| `Gfni` | **98.6 GiB/s** | 16.1x |
+| `AesNi` | 78.8 GiB/s | 12.8x |
+| `Sse2` / `Fallback` | 6.13 GiB/s | 1.0x |
+| `Avx2` | 4.84 GiB/s | 0.79x |
+| `Ssse3` | 3.53 GiB/s | 0.58x |
+
+GFNI overtakes AES-NI here, exactly as the instruction counts predict: with no
+round key to fold in, `gf2p8affineinv` alone beats `pshufb` + `aesenclast`. The
+ordering inverts on the round (table above), where absorbing the key XOR wins —
+which is why the detector prefers AES-NI, since the round is what the cipher
+actually runs. Note also that this margin is far larger than the ~6x the 64 KiB
+figure in `examples/arch_bench.rs` reports: past L1 the substitution becomes
+memory-bound and the instruction mix stops mattering.
+
+**SHA-256 compression**, 16 blocks:
+
+| Path | Throughput | |
+| :--- | ---: | ---: |
+| SHA-NI | **2.234 GiB/s** | 6.2x |
+| portable | 0.360 GiB/s | 1.0x |
+
+```mermaid
+xychart-beta
+    title "SHA-256 compression, GiB/s (higher is better)"
+    x-axis ["SHA-NI", "portable"]
+    y-axis "GiB/s" 0 --> 2.5
+    bar [2.234, 0.360]
+```
+
+**Key setup**, one `Pich256::new` (two HMAC-SHA256 passes, 16 subkeys, 62 warm-up
+rounds): 866 ns on `AesNi` against 1019 ns portable — only 1.18x, because the KDF
+half of it runs on SHA-NI either way and does not vary with the backend.
+
+**Where the hardware buys nothing.** Two results are worth recording as
+negatives:
+
+- `xor_into` over 64 KiB: 52.4 GiB/s dispatched against 51.0 GiB/s portable, a
+  2.8% difference. At this size the bulk XOR is memory-bandwidth bound and the
+  vector width is irrelevant. LLVM already auto-vectorises the portable loop.
+- The inline-assembly integer primitives: `rotr128` 1.346 ns against 1.470 ns for
+  plain Rust, and `mul128` 1.024 ns against 1.029 ns — indistinguishable. This is
+  the expected result and the reason `arch::x86_64::int` documents itself as
+  pinning the codegen rather than beating the compiler: LLVM already lowers
+  `u128::rotate_right` and `wrapping_mul` to the same `shrd`/`mul` sequences.
+
+Note the standalone `round128` column is dispatched *per call* and so pays the
+non-inlinable call described in §11.4; `keystream` is the column that reflects
+real use. It is also why `Avx2` looks worse than `Sse2` there while winning on
+throughput — the AVX2 round keeps state lane-duplicated across a buffer, which a
+one-shot call cannot amortise.
 
 ### 11.8 Portability status
 

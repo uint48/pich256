@@ -53,6 +53,23 @@ the narrowest, and nothing needs `-C target-cpu=native`. Every backend produces
 **bit-for-bit identical** output, which the test suite checks by running each
 supported backend against the portable reference.
 
+```mermaid
+flowchart TD
+    Probe["is_x86_feature_detected!<br/>once per process, cached"] --> AES{"aes + ssse3?"}
+    AES -->|"yes"| BAES["x86_64/aes-ni<br/>pshufb + aesenclast"]
+    AES -->|"no"| GF{"gfni?"}
+    GF -->|"yes"| BGF["x86_64/gfni<br/>gf2p8affineinv"]
+    GF -->|"no"| V512{"avx512 f+bw+vl+vbmi?"}
+    V512 -->|"yes"| B512["x86_64/avx512vbmi<br/>2x vpermi2b"]
+    V512 -->|"no"| V2{"avx2?"}
+    V2 -->|"yes"| BAVX["x86_64/avx2<br/>8x vpshufb"]
+    V2 -->|"no"| S3{"ssse3?"}
+    S3 -->|"yes"| BS3["x86_64/ssse3<br/>16x pshufb"]
+    S3 -->|"no"| BS2["x86_64/sse2<br/>scalar table"]
+
+    NotX86["any other target"] --> FB["portable<br/>plain Rust"]
+```
+
 | Backend | Requires | S-box strategy |
 | :--- | :--- | :--- |
 | `x86_64/aes-ni` | `aes ssse3` | `pshufb` + `aesenclast`, round-key XOR free |
@@ -107,30 +124,54 @@ The shuffle-based backends (`avx512vbmi` / `avx2` / `ssse3`) emulate the same
 table out of 16-entry byte shuffles and remain for CPUs without AES hardware, or
 VMs that mask the feature bits off.
 
-### Measuring it
+### Measured
 
 ```bash
-cargo run --release --example arch_bench
+cargo bench                          # Criterion, every backend
+cargo run --release --example arch_bench   # quick human-readable summary
 ```
 
-reports the detected backend and times every supported path against the portable
-one. Measured on a CPU with AES-NI, GFNI, AVX2 and SHA-NI:
+Criterion, 50 samples per point, on a CPU with AES-NI, GFNI, AVX2 and SHA-NI.
+**Keystream generation** — the cipher's real cost centre:
 
-Mean of five runs:
+```mermaid
+xychart-beta
+    title "Keystream throughput, MiB/s (higher is better)"
+    x-axis ["aes-ni", "gfni", "avx2", "sse2", "portable", "ssse3"]
+    y-axis "MiB/s" 0 --> 280
+    bar [259.3, 241.8, 97.3, 91.9, 92.0, 72.6]
+```
 
-| Workload | AES-NI | GFNI | AVX2 | SSSE3 | Portable |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| `sub_bytes`, 64 KiB | **0.026** | 0.025 | 0.246 | 0.273 | 0.158 ns/byte |
-| `Pich256::encrypt` | **3.88** | 4.11 | 10.11 | 13.72 | 10.96 ns/byte |
-| `sha256_compress` | **0.43** (SHA-NI) | — | — | — | 2.76 ns/byte |
+| Backend | `encrypt` (64 KiB) | `keystream` | `sub_bytes` (4 KiB) |
+| :--- | ---: | ---: | ---: |
+| `aes-ni` | **259.6 MiB/s** | **259.3 MiB/s** | 78.8 GiB/s |
+| `gfni` | 240.6 MiB/s | 241.8 MiB/s | **98.6 GiB/s** |
+| `avx2` | 98.9 MiB/s | 97.3 MiB/s | 4.84 GiB/s |
+| `sse2` | 91.5 MiB/s | 91.9 MiB/s | 6.13 GiB/s |
+| `portable` | 91.3 MiB/s | 92.0 MiB/s | 6.13 GiB/s |
+| `ssse3` | 72.6 MiB/s | 72.6 MiB/s | 3.53 GiB/s |
 
-The cipher runs **~2.8× faster** on AES hardware, and bulk substitution ~6×.
-Without it the picture is much flatter: a 256-entry byte substitution is close to
-the worst case for SIMD — an L1 table lookup is a single micro-op, whereas
-`pshufb` covers just 16 entries at a time — so the AVX2 path wins the
-latency-bound inner loop by only ~7%, and an SSSE3-only CPU is in fact *slower*
-than the scalar table. Those paths are kept for their constant-time property,
-which the AES-hardware paths share and the scalar table does not.
+| SHA-256 compression | Throughput | |
+| :--- | ---: | ---: |
+| SHA-NI | **2.234 GiB/s** | 6.2× |
+| portable | 0.360 GiB/s | 1.0× |
+
+**AES hardware is worth ~2.8× end to end**, and 13–16× on bulk substitution.
+GFNI overtakes AES-NI on bulk `sub_bytes` — with no round key to fold in, one
+`gf2p8affineinv` beats `pshufb` + `aesenclast` — but loses on the round, which is
+what the cipher actually runs, so the detector prefers AES-NI.
+
+Without AES hardware the spread is small and not uniformly favourable: `avx2`
+beats the scalar table by ~7% and `ssse3` *loses* to it by 21%, because a
+256-entry byte substitution is close to the worst case for SIMD (an L1 lookup is
+one micro-op; `pshufb` covers 16 entries). Those backends earn their place on
+constant-time execution, not speed.
+
+Two honest negatives: the vectorised bulk XOR is worth 2.8% (memory-bound at
+64 KiB, and LLVM already auto-vectorises the portable loop), and the
+inline-assembly `rotr128`/`mul128` are within noise of plain Rust — LLVM already
+emits the same `shrd`/`mul` sequences, which is why `arch::x86_64::int`
+documents itself as pinning codegen rather than beating the compiler.
 
 ### Features
 
@@ -196,9 +237,33 @@ cargo test --no-default-features --features simd
 cargo test --no-default-features --features asm
 ```
 
+## Benchmarks
+
+[Criterion](https://github.com/bheisler/criterion.rs) benchmarks live in
+[`benches/`](benches), parameterised over every backend the host CPU supports:
+
+```bash
+cargo bench                          # everything
+cargo bench -- encrypt               # one group
+cargo bench -- --save-baseline main  # record a baseline
+cargo bench -- --baseline main       # compare a later run against it
+```
+
+Groups: `key_setup`, `encrypt`, `keystream`, `sub_bytes`, `round128`, `xor_into`,
+`sha256_compress`, `int128`. The suite asserts every backend still agrees with
+the portable reference *before* timing anything, so a correctness regression
+cannot quietly present itself as a speedup.
+
+Criterion is a `dev-dependency` with default features off, so it never reaches
+anything that depends on this crate — the library itself stays dependency-free.
+Enable its default features for HTML reports and plots.
+
 ## Project layout
 
 ```
+benches/
+└── pich256.rs       Criterion suite, parameterised over every backend
+
 src/
 ├── lib.rs           crate root / module wiring
 ├── pich256.rs       Pich256 + internal State (round function, keystream)
@@ -234,8 +299,9 @@ src/
   (Dieharder / NIST STS / PractRand) on the keystream, avalanche and bit-bias
   measurements, and analysis of linear/differential resistance.
 - [ ] **Improve the S-box and internal structure**
-- [ ] **Benchmarks** — add Criterion benchmarks for throughput and key setup,
-  and track performance across the portable vs. accelerated paths.
+- [x] **Benchmarks** — Criterion benchmarks for throughput, key setup and every
+  primitive, parameterised across the portable vs. accelerated paths. See
+  [Benchmarks](#benchmarks).
 - [ ] **Publish to [crates.io](https://crates.io)** — add crate metadata
   (description, keywords, categories, repository, docs), documentation, and cut
   a release.
