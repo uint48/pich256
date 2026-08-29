@@ -333,6 +333,15 @@ This is an **educational / experimental** cipher, not a vetted standard:
 
 ---
 
+## 6.5 Implementation Note: Hardware Dispatch
+
+The specification above is implementation-independent; §11 describes how it is
+actually executed. Nothing in that layer changes the cipher — every backend is
+required to produce bit-for-bit identical keystream, and the test suite enforces
+it by running each supported backend against the portable reference.
+
+---
+
 ## 7. Public API Reference
 
 | Item | Signature | Purpose |
@@ -434,3 +443,144 @@ The crate ships an extensive in-tree test suite validating every layer:
 ```bash
 cargo test
 ```
+
+- **Architecture backends** — every primitive (`sub_bytes`, `round128`, `fill_keystream`, `rotl128`/`rotr128`, `mul128`, `xor_into`, `sha256_compress`) is checked against the portable reference *once per backend the host CPU can execute*, so a single `cargo test` on an AVX2 machine covers the AVX2, SSSE3, SSE2 and portable paths. Backend selection is process-global, so those tests serialise behind a shared lock.
+
+---
+
+## 11. Hardware Acceleration
+
+### 11.1 Dispatch model
+
+Every performance-sensitive primitive is routed through `src/arch`, which selects
+an implementation **at runtime**: the host is probed once with
+`is_x86_feature_detected!` and the answer cached in an atomic. The alternative,
+compile-time `#[cfg(target_feature)]`, was rejected because it makes a default
+build emit baseline-SSE2 code while a `-C target-cpu=native` build faults with
+`SIGILL` if copied to an older machine.
+
+`arch::fallback` is both the implementation used on targets without a backend
+(aarch64, riscv64, wasm32, …) and the reference oracle the backends are tested
+against.
+
+| Backend | Requires | S-box strategy |
+| :--- | :--- | :--- |
+| `Avx512Vbmi` | `avx512f avx512bw avx512vl avx512vbmi` | 2× `vpermi2b` over a 256-byte table |
+| `Avx2` | `avx2` | 8× `vpshufb`, two table rows per YMM |
+| `Ssse3` | `ssse3` | 16× `pshufb`, one table row per XMM |
+| `Sse2` | x86_64 baseline | scalar table lookup, vector XOR |
+| `Fallback` | anything | plain Rust |
+
+### 11.2 Vectorising a 256-entry substitution
+
+`pshufb` is a *16-entry* byte shuffle: each output byte is selected from 16
+source bytes using the low nibble of its index. The Rijndael S-box has 256
+entries, so it needs 16 shuffles — one per table row — combined so that only the
+row matching the index's high nibble contributes. The selection exploits a
+documented `pshufb` behaviour: **an index byte with its high bit set produces a
+zero output byte.** For row $r$:
+
+$$\text{idx}_r = x - 16r \pmod{256}, \qquad \text{sel}_r = \text{sat\_add}_{u8}(\text{idx}_r,\ \texttt{0x70})$$
+
+- $\text{idx}_r \le \texttt{0x0f}$ gives $\text{sel}_r \le \texttt{0x7f}$: high bit clear, low nibble intact, so the shuffle returns $\text{row}_r[\text{idx}_r]$.
+- $\text{idx}_r \ge \texttt{0x10}$ gives $\text{sel}_r \ge \texttt{0x80}$ (saturating at `0xff`): high bit set, so the shuffle returns 0.
+
+The unsigned *saturating* add is essential: a wrapping add would let
+$\text{idx}_r \in [\texttt{0x90}, \texttt{0xff}]$ fold back below `0x80` and
+produce a false hit. Exactly one row is non-zero for any byte, so OR-ing the 16
+shuffles reconstructs the full lookup.
+
+Two structural refinements matter more than the instruction count:
+
+1. **OR tree, not OR chain.** Each row derives its index straight from $x$ rather
+   than from the previous row's, and the results merge through a four-deep tree.
+   The critical path drops from ~19 dependent operations to ~7 — which is what
+   counts, because each round's output is the next round's input.
+2. **Two rows per YMM (AVX2).** `vpshufb` treats a YMM as two independent 128-bit
+   shuffles, so one register can hold rows $2p$ and $2p+1$. That halves the
+   shuffles to eight *and* cuts table registers from sixteen to eight, which is
+   what lets them stay resident instead of being reloaded from `.rodata` every
+   round.
+
+On AVX-512 the whole problem collapses: `vpermi2b` indexes a 128-byte table
+across two ZMM registers, so two of them plus a mask blend on bit 7 cover all
+256 entries.
+
+### 11.3 Where the dispatch boundary sits
+
+A `#[target_feature]` function **cannot be inlined into a caller that lacks those
+features**. Dispatching per round would therefore cost a real, non-inlinable call
+plus a spill of the 128-bit state for each of the two rounds behind every
+keystream byte. The dispatch is instead hoisted to the whole keystream buffer:
+`arch::fill_keystream` chooses once per call, and `arch::keystream_core` — the
+single normative definition of the keystream — is instantiated *inside* each
+backend's target-feature boundary so the round body inlines and the state stays
+in a register. Doing this alone cut end-to-end time from 15.3 to 13.2 ns/byte.
+
+The AVX2 path goes one step further and holds the state lane-duplicated across
+the entire buffer, so the fold and re-broadcast around the paired-row S-box
+collapse into a single `vperm2i128` + `vpor`.
+
+### 11.4 Other accelerated primitives
+
+- **SHA-NI** (`sha256rnds2`, `sha256msg1`, `sha256msg2`) for the SHA-256 block
+  compression behind the KDF. `sha256rnds2` performs two rounds at once with the
+  eight working variables held in two registers in a rotated `ABEF`/`CDGH`
+  layout, so the 64-iteration scalar loop becomes 16 groups of four rounds.
+- **Inline assembly** for the 128-bit integer primitives used by the subkey
+  generator $g$: `shld`/`shrd` double-precision shifts for the rotates, and one
+  widening `mul` plus two narrow `imul`s for the truncating $128\times128$
+  multiply.
+- **SSE2** for the state rotate — there is no cross-lane bit shift, so
+  $\text{rotr}(x,7)$ is synthesised as $(x \gg 7) \mathbin{|} \text{swap}_{64}(x \ll 57)$.
+- **AVX2/SSE2** for the bulk keystream XOR in `encrypt`/`decrypt`.
+
+### 11.5 Deliberately unused instructions
+
+**AES-NI is not used.** `aesenclast` computes AES `SubBytes` (plus `ShiftRows`)
+in a single instruction and would make the S-box nearly free, but Pich256 is
+meant to stand on its own primitives rather than on an AES core. **GFNI**
+(`vgf2p8affineinvqb`) is excluded for the same reason: with the Rijndael affine
+constant it is literally the AES S-box in hardware. Both are straightforward to
+add later as extra `Backend` variants, and `arch::cpu_summary()` already reports
+whether the host has them.
+
+A side benefit: the vector S-box never indexes memory with secret data, so those
+backends are **constant-time**. The scalar table path is not — its index into
+`SBOX` is secret-dependent and leaks through the data cache, the same weakness
+that has repeatedly broken table-driven AES implementations.
+
+### 11.6 Measured results
+
+`cargo run --release --example arch_bench`, on a Zen-class CPU with AVX2 and
+SHA-NI:
+
+| Workload | AVX2 | SSSE3 | SSE2 | Portable |
+| :--- | ---: | ---: | ---: | ---: |
+| `sub_bytes`, 64 KiB | 0.20 | 0.27 | 0.16 | 0.16 ns/byte |
+| `round128` | 6.8 | 7.5 | 5.4 | 5.4 ns/round |
+| `Pich256::encrypt` | **9.7** | 13.2 | 10.4 | 10.4 ns/byte |
+| `sha256_compress` | **0.41** (SHA-NI) | — | — | 2.55 ns/byte |
+
+Read honestly: SHA-256 gains ~6×, the cipher core only ~7%, and the SSSE3 path is
+*slower* than the scalar table. A 256-entry byte substitution is close to the
+worst case for SIMD — an L1 table lookup is one micro-op, while `pshufb` covers
+16 entries at a time — and the cipher's two full-state rounds per output byte
+form a serial dependency chain that no amount of width can shorten. The SSSE3
+path is kept for its constant-time property; `arch::force_backend` can override
+the choice.
+
+Note the standalone `round128` row is dispatched *per call* and so pays the
+non-inlinable call described in §11.3; the end-to-end row is the one that
+reflects real use.
+
+### 11.7 Portability status
+
+- **x86_64** — implemented and tested (AVX2, SSSE3, SSE2 and portable paths all
+  exercised by `cargo test` on an AVX2 host).
+- **AVX-512 VBMI** — written and compiling, but **not yet run on real hardware**;
+  no AVX-512 machine or emulator was available.
+- **aarch64 / armv7 / everything else** — falls back to the portable path;
+  cross-compilation is verified, execution is not. NEON `tbl`/`tbx` is the
+  natural next backend: it is a genuine 32-entry table lookup, so the S-box would
+  need only 8 instructions instead of 16.

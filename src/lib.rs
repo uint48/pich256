@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 #![allow(unused_assignments)]
 
+pub mod arch;
 mod bigint;
 pub mod pich256;
 mod sbox;

@@ -1,8 +1,8 @@
+use crate::arch;
 use crate::bigint::int128::I128;
 use crate::kdf::{derive_256bit_key, split_key_into_128bit_limbs};
 use crate::key_gen::gen_sub_keys;
 use crate::round_key::Roundkey;
-use crate::sbox::sbox_transform;
 
 pub struct Pich256{
     st: State
@@ -22,21 +22,28 @@ impl Pich256 {
     }
     #[inline]
     pub fn encrypt(&mut self, msg: &[u8]) -> Vec<u8> {
-        let mut ciphertext = Vec::with_capacity(msg.len());
-        for &byte in msg {
-            // XOR each plaintext byte with the next keystream byte
-            ciphertext.push(byte ^ self.st.next_byte());
-        }
-        ciphertext
+        // Generate the keystream into the output buffer first, then fold the
+        // plaintext in with a vectorised XOR. Splitting it this way lets the
+        // whole message be combined 32 bytes at a time instead of one byte at a
+        // time; see `arch::xor_into`.
+        let mut out = vec![0u8; msg.len()];
+        self.st.fill_keystream(&mut out);
+        arch::xor_into(&mut out, msg);
+        out
     }
 
     #[inline]
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Vec<u8> {
-        let mut plaintext = Vec::with_capacity(ciphertext.len());
-        for &byte in ciphertext {
-            plaintext.push(byte ^ self.st.next_byte());
-        }
-        plaintext
+        // A stream cipher is its own inverse: same keystream, same XOR.
+        self.encrypt(ciphertext)
+    }
+
+    /// Names the code path this process selected, e.g. `"x86_64/avx2"`.
+    ///
+    /// The cipher's output is identical on every backend; this is purely for
+    /// diagnostics and benchmarking.
+    pub fn backend_name() -> &'static str {
+        arch::backend().name()
     }
 }
 
@@ -47,6 +54,13 @@ impl Pich256 {
 struct State{
     w: I128,
     sub_keys: Vec<Roundkey>,
+    /// The round keys' 128-bit words, flattened out of `sub_keys`.
+    ///
+    /// `sub_keys` stays the source of truth (it also carries each key's id and
+    /// round constant); this is the contiguous `&[u128]` the keystream loop in
+    /// `crate::arch` indexes, so the hot path never touches a `Roundkey` struct.
+    /// Built once in `new` and never mutated afterwards.
+    schedule: Vec<u128>,
     round_index: usize,
 }
 
@@ -56,9 +70,13 @@ impl State {
     // ke: key expansion seed -> low limb of key
     // w: initial state vector (w0) -> high limb of key
     pub fn new(w: I128, ke: I128) -> Self {
+        let sub_keys = gen_sub_keys(ke);
+        let schedule = sub_keys.iter().map(|rk| rk.sub_key.0 as u128).collect();
+
         let mut state = Self {
             w,
-            sub_keys: gen_sub_keys(ke),
+            sub_keys,
+            schedule,
             round_index: 0,
         };
 
@@ -93,12 +111,19 @@ impl State {
     pub fn round(&mut self) {
         let sub_key = self.next_rk().sub_key;
 
-        // Rotation (Diffusion)
-        self.w = self.w.rotate_right(7);
-        // S-Box Transformation (Confusion)
-        self.w = sbox_transform(self.w);
-        // Key Mixing (XOR)
-        self.w = self.w ^ sub_key;
+        // The three steps of a round are
+        //
+        //     self.w = self.w.rotate_right(7);   // Rotation   (diffusion)
+        //     self.w = sbox_transform(self.w);   // S-Box      (confusion)
+        //     self.w = self.w ^ sub_key;         // Key mixing (XOR)
+        //
+        // but they are dispatched as one fused operation. This is the hottest
+        // code in the cipher - two rounds per keystream byte - and on x86_64 the
+        // fused form keeps the 128-bit state in a single XMM register for all
+        // three steps instead of shuttling it between general-purpose and vector
+        // registers twice per round. `arch::fallback::round128` performs exactly
+        // the three lines above, and the tests below check the two agree.
+        self.w = I128::new(arch::round128(self.w.0 as u128, sub_key.0 as u128) as i128);
     }
 
     // Keystream generator, produce a single, pseudo-random byte that will be XORed with
@@ -119,6 +144,22 @@ impl State {
         w_bytes[idx]
     }
 
+
+    /// Fills `out` with successive keystream bytes.
+    ///
+    /// Equivalent to calling [`Self::next_byte`] once per slot, but the whole
+    /// loop is handed to `crate::arch` in one go so the selected backend can run
+    /// it inside its own target-feature context; see `arch::fill_keystream`.
+    #[inline]
+    pub fn fill_keystream(&mut self, out: &mut [u8]) {
+        let mut w = self.w.0 as u128;
+        let mut round_index = self.round_index;
+
+        arch::fill_keystream(&mut w, &self.schedule, &mut round_index, out);
+
+        self.w = I128::new(w as i128);
+        self.round_index = round_index;
+    }
 
     #[inline]
     pub fn get_round_key(&self, round_index: usize) -> &Roundkey {
@@ -359,6 +400,82 @@ mod tests {
         let expected_byte = expected_bytes[idx];
 
         assert_eq!(state.next_byte(), expected_byte);
+    }
+
+    #[test]
+    fn test_round_matches_explicit_three_steps() {
+        // `round()` uses the fused `arch::round128`. Pin it against the literal
+        // rotate / S-box / XOR sequence it replaces, on every backend the host
+        // can run.
+        use crate::sbox::sbox_transform;
+
+        let mut state = State::new(I128::new(0x1234_5678), I128::new(-0x9ABC));
+        for _ in 0..256 {
+            let key = state.get_round_key(state.round_index).sub_key;
+            let expected = sbox_transform(state.w.rotate_right(7)) ^ key;
+
+            state.round();
+
+            assert_eq!(state.w, expected);
+        }
+    }
+
+    #[test]
+    fn test_fill_keystream_matches_repeated_next_byte() {
+        // `fill_keystream` hands the loop to the arch layer; `next_byte` runs it
+        // one byte at a time through `round()`. They must be the same stream,
+        // and must leave the state and round counter in the same place.
+        let mut bulk = State::new(I128::new(0x0BAD_C0DE), I128::new(0x1234_5678));
+        let mut one_at_a_time = State::new(I128::new(0x0BAD_C0DE), I128::new(0x1234_5678));
+
+        let mut from_bulk = vec![0u8; 500];
+        bulk.fill_keystream(&mut from_bulk);
+
+        let from_next: Vec<u8> = (0..500).map(|_| one_at_a_time.next_byte()).collect();
+
+        assert_eq!(from_bulk, from_next);
+        assert_eq!(bulk.w, one_at_a_time.w);
+        assert_eq!(bulk.round_index, one_at_a_time.round_index);
+    }
+
+    #[test]
+    fn test_fill_keystream_resumes_across_calls() {
+        // Splitting one buffer into two calls must not restart or skip the
+        // stream: the round counter carries over.
+        let mut whole = State::new(I128::new(7), I128::new(11));
+        let mut split = State::new(I128::new(7), I128::new(11));
+
+        let mut a = vec![0u8; 100];
+        whole.fill_keystream(&mut a);
+
+        let mut b = vec![0u8; 100];
+        split.fill_keystream(&mut b[..37]);
+        split.fill_keystream(&mut b[37..]);
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_keystream_is_backend_independent() {
+        // The whole point of the arch layer: every backend this host can run
+        // must produce byte-for-byte identical ciphertext. The message is long
+        // enough to wrap the 16-key schedule many times and to exercise the
+        // vector paths' tails.
+        let msg: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+
+        // The reference: the portable path, pinned explicitly.
+        arch::force_backend(arch::Backend::Fallback);
+        let portable = Pich256::new("backend-equivalence").encrypt(&msg);
+        arch::reset_backend();
+
+        arch::for_each_backend(|b| {
+            let actual = Pich256::new("backend-equivalence").encrypt(&msg);
+            assert_eq!(actual, portable, "{} ciphertext differs", b.name());
+        });
+
+        // And the ciphertext must actually decrypt back.
+        let mut dec = Pich256::new("backend-equivalence");
+        assert_eq!(dec.decrypt(&portable), msg);
     }
 
     #[test]

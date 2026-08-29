@@ -1,3 +1,4 @@
+use crate::arch;
 use crate::bigint::int128::I128;
 use crate::rc::{p, RCS};
 use crate::round_key::Roundkey;
@@ -24,16 +25,23 @@ pub fn gen_sub_keys(ke: I128) -> Vec<Roundkey> {
 
 // key mixing function that generates the next subkey
 // Subkey Generator Function
+//
+// The rotates and the 128-bit multiply go through `crate::arch` so that on
+// x86_64 they compile to the dedicated `shld`/`shrd` double-precision shifts and
+// the `mul`/`imul` widening-product sequence written out in
+// `arch::x86_64::int`. The single-byte S-box stays a scalar table lookup: it is
+// one byte of *key schedule* material, evaluated 15 times at construction, so
+// there is nothing to vectorise.
 #[inline]
 pub fn g(x: I128, rc: i64) -> I128 {
     // y = rotl(x, 7);
-    let mut y = x.rotate_left(7);
+    let mut y = arch::rotl128(x.0 as u128, 7);
 
     // y = y * rc;
-    y = y * I128::new(rc as i128);
+    y = arch::mul128(y, rc as i128 as u128);
 
     // y = rotr(y, 4);
-    y = y.rotate_right(4);
+    y = arch::rotr128(y, 4);
 
     // Byte manipulation
     let mut bytes = y.to_le_bytes();
@@ -41,10 +49,10 @@ pub fn g(x: I128, rc: i64) -> I128 {
     // Apply the S-box to the byte at offset 14
     bytes[14] = sbox(bytes[14]);
 
-    y = I128::from_le_bytes(bytes);
+    y = u128::from_le_bytes(bytes);
 
     // y = rotl(y, 4);
-    y = y.rotate_left(4);
+    y = arch::rotl128(y, 4);
 
-    y
+    I128::new(y as i128)
 }

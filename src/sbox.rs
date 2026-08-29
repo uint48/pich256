@@ -1,14 +1,22 @@
+use crate::arch;
 use crate::bigint::int128::I128;
 use crate::bigint::int192::I192;
 
 /// Composition function: sbox_transform(input) = cbox(sboxes(xbox(input)))
 /// Expands 128→192, applies S-box substitution, then compresses 192→128
+///
+/// The 128→192→128 detour is a no-op as far as the result is concerned: `xbox`
+/// zero-extends and `cbox` discards exactly that extension, and the S-box in
+/// between is bytewise, so the whole composition is just "substitute each of the
+/// 16 bytes". This function therefore substitutes the 16 bytes directly through
+/// [`crate::arch::sub_bytes`], which on x86_64 does all 16 in vector registers
+/// without a secret-dependent memory access. The equivalence is pinned down by
+/// `test_sbox_transform_equals_xbox_sboxes_cbox`.
 #[inline]
 pub fn sbox_transform(input: I128) -> I128 {
-    let expanded = xbox(input);        // 128 → 192 bits
-    let substituted = sboxes(expanded); // Apply S-box to all bytes
-    let compressed = cbox(substituted); // 192 → 128 bits
-    compressed
+    let mut bytes = input.to_le_bytes();
+    arch::sub_bytes(&mut bytes);
+    I128::from_le_bytes(bytes)
 }
 
 /// Zero-extends a 128-bit integer to 192 bits
@@ -41,7 +49,7 @@ pub fn cbox(input: I192) -> I128 {
 /// construction is what gives the S-box its non-linearity (confusion) while
 /// guaranteeing it is a permutation, so `sbox` never collides two distinct
 /// input bytes onto the same output byte.
-const SBOX: [u8; 256] = [
+pub(crate) const SBOX: [u8; 256] = [
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
     0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
     0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
@@ -68,15 +76,9 @@ pub fn sbox(byte: u8) -> u8 {
 
 /// Applies S-box substitution to all 24 bytes of a 192-bit integer
 pub fn sboxes(input: I192) -> I192 {
-    let bytes = input.to_be_bytes();
-
-    // Apply S-box to each byte
-    let mut substituted = [0u8; 24];
-    for i in 0..24 {
-        substituted[i] = sbox(bytes[i]);
-    }
-
-    I192::from_be_bytes(substituted)
+    let mut bytes = input.to_be_bytes();
+    arch::sub_bytes(&mut bytes);
+    I192::from_be_bytes(bytes)
 }
 
 #[cfg(test)]
@@ -196,6 +198,19 @@ mod tests {
         // Every byte of a zero input substitutes to 0x63.
         let expected = I128::from_be_bytes([0x63; 16]);
         assert_eq!(sbox_transform(I128::ZERO), expected);
+    }
+
+    #[test]
+    fn test_sbox_transform_equals_xbox_sboxes_cbox() {
+        // `sbox_transform` no longer literally routes the state through I192,
+        // so pin the shortcut against the composition it stands in for.
+        for seed in 0..64u128 {
+            let input = I128::new(
+                (seed.wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835) ^ (seed << 97))
+                    as i128,
+            );
+            assert_eq!(sbox_transform(input), cbox(sboxes(xbox(input))));
+        }
     }
 
     #[test]

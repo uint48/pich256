@@ -5,6 +5,19 @@ edition = "2024"
 
 [dependencies]
 
+[features]
+default = ["simd", "asm"]
+
+# Enables the architecture-specific vector backends in `src/arch`. The backend
+# is still chosen by runtime CPU detection, so this stays safe to leave on for
+# a portable binary. Turn it off to route every call through the portable
+# reference code in `src/arch/fallback.rs`.
+simd = []
+
+# Enables the inline-assembly 128-bit integer primitives in
+# `src/arch/x86_64/int.rs`. Off means the equivalent plain-Rust operations.
+asm = []
+
 [profile.release]
 opt-level = 3
 #Normally, the Rust compiler (via LLVM) optimizes each crate (compilation unit) individually. It doesn't know what the other crates are doing while it's compiling them.
