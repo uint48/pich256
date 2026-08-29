@@ -4,3 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+[profile.release]
+opt-level = 3
+#Normally, the Rust compiler (via LLVM) optimizes each crate (compilation unit) individually. It doesn't know what the other crates are doing while it's compiling them.
+#When you enable LTO, the compiler delays the final optimization step until the very end of the build process, when all the crates are being linked together into the final binary. This allows the compiler to see the entire program at once and optimize across crate boundaries.
+#2. The Benefits (Pros)
+#Smaller Binary Size: The compiler can perform aggressive "dead code elimination." If a function in Crate A is only used by Crate B, and Crate B doesn't use it, LTO allows the compiler to realize this and completely remove the function from the final binary.
+#Faster Runtime Performance: Because the compiler can see the whole program, it can inline functions across different crates, leading to faster execution speeds.
+#3. The Drawbacks (Cons)
+#Much Slower Compile Times: Because the compiler has to analyze the entire program at the very end, the final linking step can take significantly longer. For large projects, this can add minutes to your build time.
+#Higher Memory Usage: The compiler needs to hold the intermediate representation of the entire program in memory during the linking phase, which can cause out-of-memory errors on machines with limited RAM.
+lto = false
+codegen-units = 1
+panic = "abort"
+strip = true
