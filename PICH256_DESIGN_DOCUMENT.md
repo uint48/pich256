@@ -609,7 +609,7 @@ row matching the index's high nibble contributes. The selection exploits a
 documented `pshufb` behaviour: **an index byte with its high bit set produces a
 zero output byte.** For row $r$:
 
-$$\text{idx}_r = x - 16r \pmod{256}, \qquad \text{sel}_r = \text{sat\_add}_{u8}(\text{idx}_r,\ \texttt{0x70})$$
+$$\text{idx}_r = x - 16r \pmod{256}, \qquad \text{sel}_r = \min\big(\text{idx}_r + \texttt{0x70},\ \texttt{0xff}\big)$$
 
 - $\text{idx}_r \le \texttt{0x0f}$ gives $\text{sel}_r \le \texttt{0x7f}$: high bit clear, low nibble intact, so the shuffle returns $\text{row}_r[\text{idx}_r]$.
 - $\text{idx}_r \ge \texttt{0x10}$ gives $\text{sel}_r \ge \texttt{0x80}$ (saturating at `0xff`): high bit set, so the shuffle returns 0.
