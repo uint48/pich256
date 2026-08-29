@@ -465,13 +465,51 @@ against.
 
 | Backend | Requires | S-box strategy |
 | :--- | :--- | :--- |
+| `AesNi` | `aes ssse3` | `pshufb` + `aesenclast`, round-key XOR absorbed |
+| `Gfni` | `gfni` | one `gf2p8affineinv` |
 | `Avx512Vbmi` | `avx512f avx512bw avx512vl avx512vbmi` | 2× `vpermi2b` over a 256-byte table |
 | `Avx2` | `avx2` | 8× `vpshufb`, two table rows per YMM |
 | `Ssse3` | `ssse3` | 16× `pshufb`, one table row per XMM |
 | `Sse2` | x86_64 baseline | scalar table lookup, vector XOR |
 | `Fallback` | anything | plain Rust |
 
-### 11.2 Vectorising a 256-entry substitution
+### 11.2 The S-box on AES hardware
+
+§4.4 establishes that Pich256's confusion core reduces to a byte-wise Rijndael
+S-box. That is precisely the substitution x86_64 has implemented in silicon since
+Westmere, and two unrelated instruction sets expose it.
+
+**AES-NI.** `aesenclast` is a complete final AES round:
+
+$$\texttt{aesenclast}(x, k) = \text{SubBytes}(\text{ShiftRows}(x)) \oplus k$$
+
+$\text{SubBytes}$ is byte-wise and $\text{ShiftRows}$ is a byte permutation, so
+the two commute and the unwanted $\text{ShiftRows}$ can be cancelled by
+permuting the input first:
+
+$$\texttt{aesenclast}(\text{InvShiftRows}(x), k) = \text{SubBytes}(x) \oplus k$$
+
+$\text{InvShiftRows}$ is a single `pshufb` with the gather mask
+$[0,13,10,7,\;4,1,14,11,\;8,5,2,15,\;12,9,6,3]$, derived by inverting
+$\text{ShiftRows}(x)[r+4c] = x[r + 4((c+r) \bmod 4)]$.
+
+The consequence for §4.3 is that the round's key-mixing step comes along **for
+free**: the $\oplus k$ is already part of the instruction. A complete Pich256
+round on AES-NI is the rotate, one `pshufb`, and one `aesenclast`.
+
+**GFNI.** `vgf2p8affineinvqb(x, A, b)` computes, per byte, the multiplicative
+inverse in $\mathrm{GF}(2^8)$ modulo the AES polynomial `0x11B` followed by the
+affine map $A\cdot\mathrm{inv}(x) + b$ over $\mathrm{GF}(2)$ — the textbook
+definition of the Rijndael S-box (§4.4). With $A$ = the Rijndael matrix
+(`0xF1E3C78F1F3E7CF8` packed per 64-bit lane) and $b = \texttt{0x63}$, the
+substitution is one instruction, with the key XOR as a separate `pxor`.
+
+Both identities and both constants are validated against the 256-entry table in
+every one of the 16 lane positions. This matters: a wrong `InvShiftRows` mask
+still produces a permutation of the correct bytes, so a test fed uniform input
+would pass.
+
+### 11.3 Vectorising a 256-entry substitution *without* AES hardware
 
 `pshufb` is a *16-entry* byte shuffle: each output byte is selected from 16
 source bytes using the low nibble of its index. The Rijndael S-box has 256
@@ -506,7 +544,10 @@ On AVX-512 the whole problem collapses: `vpermi2b` indexes a 128-byte table
 across two ZMM registers, so two of them plus a mask blend on bit 7 cover all
 256 entries.
 
-### 11.3 Where the dispatch boundary sits
+These shuffle backends remain the path for CPUs predating AES-NI, and for VMs or
+firmware that mask the AES feature bits off.
+
+### 11.4 Where the dispatch boundary sits
 
 A `#[target_feature]` function **cannot be inlined into a caller that lacks those
 features**. Dispatching per round would therefore cost a real, non-inlinable call
@@ -521,7 +562,7 @@ The AVX2 path goes one step further and holds the state lane-duplicated across
 the entire buffer, so the fold and re-broadcast around the paired-row S-box
 collapse into a single `vperm2i128` + `vpor`.
 
-### 11.4 Other accelerated primitives
+### 11.5 Other accelerated primitives
 
 - **SHA-NI** (`sha256rnds2`, `sha256msg1`, `sha256msg2`) for the SHA-256 block
   compression behind the KDF. `sha256rnds2` performs two rounds at once with the
@@ -535,49 +576,49 @@ collapse into a single `vperm2i128` + `vpor`.
   $\text{rotr}(x,7)$ is synthesised as $(x \gg 7) \mathbin{|} \text{swap}_{64}(x \ll 57)$.
 - **AVX2/SSE2** for the bulk keystream XOR in `encrypt`/`decrypt`.
 
-### 11.5 Deliberately unused instructions
+### 11.6 Side-channel note
 
-**AES-NI is not used.** `aesenclast` computes AES `SubBytes` (plus `ShiftRows`)
-in a single instruction and would make the S-box nearly free, but Pich256 is
-meant to stand on its own primitives rather than on an AES core. **GFNI**
-(`vgf2p8affineinvqb`) is excluded for the same reason: with the Rijndael affine
-constant it is literally the AES S-box in hardware. Both are straightforward to
-add later as extra `Backend` variants, and `arch::cpu_summary()` already reports
-whether the host has them.
+None of the vector backends — AES-NI, GFNI, or the shuffle-based ones — ever
+indexes memory with secret data, so all of them are **constant-time**. The scalar
+table path is not: its index into `SBOX` is secret-dependent and leaks through
+the data cache, the same weakness that has repeatedly broken table-driven AES
+implementations. This is the reason the SSSE3 backend is retained even though it
+measures slower than the scalar table.
 
-A side benefit: the vector S-box never indexes memory with secret data, so those
-backends are **constant-time**. The scalar table path is not — its index into
-`SBOX` is secret-dependent and leaks through the data cache, the same weakness
-that has repeatedly broken table-driven AES implementations.
+### 11.7 Measured results
 
-### 11.6 Measured results
+`cargo run --release --example arch_bench`, on a CPU with AES-NI, GFNI, AVX2 and
+SHA-NI. Mean of five runs; run-to-run spread is a few percent, so treat the
+ratios rather than the absolute figures as the result:
 
-`cargo run --release --example arch_bench`, on a Zen-class CPU with AVX2 and
-SHA-NI:
+| Workload | AES-NI | GFNI | AVX2 | SSSE3 | SSE2 | Portable |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `sub_bytes`, 64 KiB | **0.026** | 0.025 | 0.246 | 0.273 | 0.160 | 0.158 ns/byte |
+| `round128` | **3.10** | 3.24 | 6.88 | 8.48 | 5.68 | 5.63 ns/round |
+| `Pich256::encrypt` | **3.88** | 4.11 | 10.11 | 13.72 | 10.75 | 10.96 ns/byte |
+| `sha256_compress` | **0.43** (SHA-NI) | — | — | — | — | 2.76 ns/byte |
 
-| Workload | AVX2 | SSSE3 | SSE2 | Portable |
-| :--- | ---: | ---: | ---: | ---: |
-| `sub_bytes`, 64 KiB | 0.20 | 0.27 | 0.16 | 0.16 ns/byte |
-| `round128` | 6.8 | 7.5 | 5.4 | 5.4 ns/round |
-| `Pich256::encrypt` | **9.7** | 13.2 | 10.4 | 10.4 ns/byte |
-| `sha256_compress` | **0.41** (SHA-NI) | — | — | 2.55 ns/byte |
+The cipher runs ~2.8× faster on AES hardware and bulk substitution ~6×; SHA-256
+gains ~6× from SHA-NI. Without AES hardware the picture is far flatter — the AVX2
+path wins the latency-bound inner loop by ~7% and the SSSE3 path loses to the
+scalar table outright — because a 256-entry byte substitution is close to the
+worst case for SIMD, and because the cipher's two full-state rounds per output
+byte form a serial dependency chain that no amount of width can shorten.
 
-Read honestly: SHA-256 gains ~6×, the cipher core only ~7%, and the SSSE3 path is
-*slower* than the scalar table. A 256-entry byte substitution is close to the
-worst case for SIMD — an L1 table lookup is one micro-op, while `pshufb` covers
-16 entries at a time — and the cipher's two full-state rounds per output byte
-form a serial dependency chain that no amount of width can shorten. The SSSE3
-path is kept for its constant-time property; `arch::force_backend` can override
-the choice.
+AES-NI edges out GFNI on the *round* despite needing two instructions to GFNI's
+one, because `aesenclast` also performs the round's key XOR; on bulk `sub_bytes`,
+where there is no key to fold, the two are level. Every CPU with GFNI also has
+AES-NI, so the detector prefers AES-NI and GFNI is reachable through
+`arch::force_backend`.
 
 Note the standalone `round128` row is dispatched *per call* and so pays the
-non-inlinable call described in §11.3; the end-to-end row is the one that
+non-inlinable call described in §11.4; the end-to-end row is the one that
 reflects real use.
 
-### 11.7 Portability status
+### 11.8 Portability status
 
-- **x86_64** — implemented and tested (AVX2, SSSE3, SSE2 and portable paths all
-  exercised by `cargo test` on an AVX2 host).
+- **x86_64** — implemented and tested (AES-NI, GFNI, AVX2, SSSE3, SSE2 and
+  portable paths all exercised by `cargo test` on the development host).
 - **AVX-512 VBMI** — written and compiling, but **not yet run on real hardware**;
   no AVX-512 machine or emulator was available.
 - **aarch64 / armv7 / everything else** — falls back to the portable path;

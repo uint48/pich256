@@ -61,6 +61,11 @@ pub enum Backend {
     Avx2 = 3,
     /// `vpermi2b`-based constant-time S-box, 64 bytes per pass.
     Avx512Vbmi = 4,
+    /// AES hardware: `pshufb` + `aesenclast` computes the S-box *and* the round
+    /// key XOR in two instructions.
+    AesNi = 5,
+    /// GFNI: `gf2p8affineinv` computes the S-box in a single instruction.
+    Gfni = 6,
 }
 
 impl Backend {
@@ -70,6 +75,8 @@ impl Backend {
             2 => Backend::Ssse3,
             3 => Backend::Avx2,
             4 => Backend::Avx512Vbmi,
+            5 => Backend::AesNi,
+            6 => Backend::Gfni,
             _ => Backend::Fallback,
         }
     }
@@ -82,6 +89,8 @@ impl Backend {
             Backend::Ssse3 => "x86_64/ssse3",
             Backend::Avx2 => "x86_64/avx2",
             Backend::Avx512Vbmi => "x86_64/avx512vbmi",
+            Backend::AesNi => "x86_64/aes-ni",
+            Backend::Gfni => "x86_64/gfni",
         }
     }
 }
@@ -95,6 +104,27 @@ static SELECTED: AtomicU8 = AtomicU8::new(UNPROBED);
 fn detect() -> Backend {
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
+        // The AES-hardware backends come first: Pich256's confusion layer *is*
+        // the Rijndael S-box, so these compute it directly instead of emulating
+        // a 256-entry table with byte shuffles. That beats every vector path
+        // here regardless of how wide the vector units are.
+        //
+        // AES-NI is preferred over GFNI even though `gf2p8affineinv` is one
+        // instruction to `aesenclast`'s two, because `aesenclast` also absorbs
+        // the round's key XOR, and it measures consistently faster on the
+        // hardware this was developed on (3.7 vs 4.0 ns/byte end to end). Any
+        // CPU with GFNI has AES-NI too, so GFNI is in practice a documented
+        // alternative reachable through `force_backend` rather than a path the
+        // detector picks; re-run `examples/arch_bench.rs` before assuming the
+        // ordering holds on a different microarchitecture.
+        if is_x86_feature_detected!("aes") && is_x86_feature_detected!("ssse3") {
+            return Backend::AesNi;
+        }
+        if is_x86_feature_detected!("gfni") {
+            return Backend::Gfni;
+        }
+
+        // No AES hardware: fall back to emulating the table with byte shuffles.
         // Widest first. AVX-512 needs all four sub-features: `f` for the base
         // 512-bit encoding, `bw` for byte/word ops and the 64-lane mask,
         // `vbmi` for `vpermi2b`, and `vl` for the 128/256-bit forms.
@@ -158,6 +188,12 @@ pub fn supported_backends() -> Vec<Backend> {
 
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
+        if is_x86_feature_detected!("aes") && is_x86_feature_detected!("ssse3") {
+            all.push(Backend::AesNi);
+        }
+        if is_x86_feature_detected!("gfni") {
+            all.push(Backend::Gfni);
+        }
         if is_x86_feature_detected!("avx512f")
             && is_x86_feature_detected!("avx512bw")
             && is_x86_feature_detected!("avx512vl")
@@ -216,6 +252,29 @@ pub fn cpu_summary() -> String {
     }
 }
 
+/// Whether 256-bit integer vectors are available for the bulk keystream XOR.
+///
+/// Probed independently of [`Backend`] because the two are orthogonal: the
+/// backend names an *S-box* strategy, and a CPU can have AES hardware without
+/// AVX2 or AVX2 without AES hardware.
+#[inline]
+fn has_avx2() -> bool {
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    {
+        static AVX2: AtomicU8 = AtomicU8::new(UNPROBED);
+        let cached = AVX2.load(Ordering::Relaxed);
+        if cached != UNPROBED {
+            return cached == 1;
+        }
+        let ok = is_x86_feature_detected!("avx2");
+        AVX2.store(ok as u8, Ordering::Relaxed);
+        ok
+    }
+
+    #[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
+    false
+}
+
 /// Whether SHA-NI is available and will be used for SHA-256 compression.
 ///
 /// Reported separately from [`Backend`] because the SHA extensions are an
@@ -253,6 +312,8 @@ pub fn sub_bytes(bytes: &mut [u8]) {
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
         match backend() {
+            Backend::Gfni => return unsafe { x86_64::aes::sub_bytes_gfni(bytes) },
+            Backend::AesNi => return unsafe { x86_64::aes::sub_bytes_aesni(bytes) },
             Backend::Avx512Vbmi => return unsafe { x86_64::sbox::sub_bytes_avx512(bytes) },
             Backend::Avx2 => return unsafe { x86_64::sbox::sub_bytes_avx2(bytes) },
             Backend::Ssse3 => return unsafe { x86_64::sbox::sub_bytes_ssse3(bytes) },
@@ -274,6 +335,8 @@ pub fn round128(w: u128, sub_key: u128) -> u128 {
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
         match backend() {
+            Backend::Gfni => return unsafe { x86_64::aes::round128_gfni(w, sub_key) },
+            Backend::AesNi => return unsafe { x86_64::aes::round128_aesni(w, sub_key) },
             Backend::Avx512Vbmi => return unsafe { x86_64::sbox::round128_avx512(w, sub_key) },
             Backend::Avx2 => return unsafe { x86_64::sbox::round128_avx2(w, sub_key) },
             Backend::Ssse3 => return unsafe { x86_64::sbox::round128_ssse3(w, sub_key) },
@@ -345,6 +408,12 @@ pub fn fill_keystream(w: &mut u128, schedule: &[u128], round_index: &mut usize, 
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
         match backend() {
+            Backend::Gfni => {
+                return unsafe { x86_64::aes::fill_keystream_gfni(w, schedule, round_index, out) };
+            }
+            Backend::AesNi => {
+                return unsafe { x86_64::aes::fill_keystream_aesni(w, schedule, round_index, out) };
+            }
             Backend::Avx512Vbmi => {
                 return unsafe { x86_64::sbox::fill_keystream_avx512(w, schedule, round_index, out) };
             }
@@ -404,14 +473,14 @@ pub fn mul128(a: u128, b: u128) -> u128 {
 pub fn xor_into(dst: &mut [u8], src: &[u8]) {
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
-        match backend() {
-            Backend::Avx512Vbmi | Backend::Avx2 => {
+        // Bulk XOR has nothing to do with the S-box, so it asks about vector
+        // width directly rather than reading it off the backend.
+        if backend() != Backend::Fallback {
+            if has_avx2() {
                 return unsafe { x86_64::sbox::xor_into_avx2(dst, src) };
             }
-            Backend::Ssse3 | Backend::Sse2 => {
-                return unsafe { x86_64::sbox::xor_into_sse2(dst, src) };
-            }
-            _ => {}
+            // SSE2 is guaranteed on x86_64, so this needs no further check.
+            return unsafe { x86_64::sbox::xor_into_sse2(dst, src) };
         }
     }
     fallback::xor_into(dst, src)
@@ -531,6 +600,51 @@ mod tests {
             let mut actual: Vec<u8> = (0..=255u8).collect();
             sub_bytes(&mut actual);
             assert_eq!(actual, expected, "{}", b.name());
+        });
+    }
+
+    #[test]
+    fn test_aes_hardware_matches_table_in_every_lane() {
+        // The AES-hardware backends rest on two identities that are easy to get
+        // subtly wrong:
+        //
+        //   aesenclast(InvShiftRows(x), k) == SubBytes(x) XOR k
+        //   gf2p8affineinv(x, RIJNDAEL_MATRIX, 0x63) == SubBytes(x)
+        //
+        // A wrong `InvShiftRows` mask still produces *some* permutation of the
+        // right bytes, so a test that only fed uniform input would pass. Feed
+        // each of the 256 byte values through each of the 16 lane positions and
+        // check the substitution lands in the lane it started in.
+        for_each_backend(|b| {
+            for high in 0..16u16 {
+                let mut block = [0u8; 16];
+                for (lane, slot) in block.iter_mut().enumerate() {
+                    *slot = (high * 16 + lane as u16) as u8;
+                }
+
+                let expected: Vec<u8> = block.iter().map(|&x| SBOX[x as usize]).collect();
+
+                let mut actual = block;
+                sub_bytes(&mut actual);
+
+                assert_eq!(actual.to_vec(), expected, "{} at block {high}", b.name());
+            }
+
+            // And the same coverage with the lane order reversed, so a mask that
+            // happens to be self-inverse on the ascending pattern is caught too.
+            for high in 0..16u16 {
+                let mut block = [0u8; 16];
+                for (lane, slot) in block.iter_mut().enumerate() {
+                    *slot = (high * 16 + (15 - lane) as u16) as u8;
+                }
+
+                let expected: Vec<u8> = block.iter().map(|&x| SBOX[x as usize]).collect();
+
+                let mut actual = block;
+                sub_bytes(&mut actual);
+
+                assert_eq!(actual.to_vec(), expected, "{} reversed at block {high}", b.name());
+            }
         });
     }
 

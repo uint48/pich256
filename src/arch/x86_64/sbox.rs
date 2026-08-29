@@ -26,20 +26,23 @@
 //! Exactly one row is ever non-zero, so OR-ing the 16 shuffles reconstructs the
 //! full 256-entry lookup.
 //!
-//! # Why bother, when a scalar `SBOX[b]` is one load?
+//! # When is this used?
 //!
-//! Honestly, not for raw throughput. An L1 table lookup is a single micro-op and
-//! modern cores sustain two per cycle, whereas the shuffle sequence above costs
-//! roughly four micro-ops per byte; measured on an AVX2 host the vector path
-//! wins the cipher's *latency-bound* inner loop by about 7%, and loses the bulk
-//! throughput case outright (see `examples/arch_bench.rs`).
+//! Only when the CPU has no AES hardware. Pich256's S-box *is* the Rijndael
+//! S-box, so on anything from 2010 onwards [`super::aes`] computes it directly
+//! with `aesenclast` or `gf2p8affineinv` and beats everything here by roughly 3x
+//! end to end. These backends cover older x86_64 parts, and VMs or firmware that
+//! mask off the AES feature bits.
 //!
-//! The reason it is the default anyway is that it is **constant-time**: no memory
-//! address ever depends on secret data, so there is no cache-timing side channel
-//! of the kind that has repeatedly broken table-driven AES implementations. The
-//! scalar path in [`crate::arch::fallback`] cannot make that promise. Callers who
-//! want the faster table lookup can select it with
-//! [`crate::arch::force_backend`].
+//! Against the *scalar* table in [`crate::arch::fallback`] the trade is subtler.
+//! An L1 lookup is a single micro-op and modern cores sustain two per cycle,
+//! whereas the shuffle sequence above costs roughly four micro-ops per byte; the
+//! AVX2 path wins the cipher's latency-bound inner loop by about 7% and loses
+//! the bulk throughput case outright. What it does buy unconditionally is
+//! **constant time**: no memory address ever depends on secret data, so there is
+//! no cache-timing side channel of the kind that has repeatedly broken
+//! table-driven AES implementations - a property the AES-hardware paths share
+//! and the scalar table does not.
 
 use core::arch::x86_64::*;
 
@@ -319,7 +322,7 @@ pub unsafe fn sub_bytes_avx512(bytes: &mut [u8]) {
 /// spilled bits.
 #[inline]
 #[target_feature(enable = "sse2")]
-unsafe fn rotr7_x128(x: __m128i) -> __m128i {
+pub(super) unsafe fn rotr7_x128(x: __m128i) -> __m128i {
     // Register-only intrinsics: no memory is touched, so no `unsafe` block is
     // needed inside this `unsafe fn`.
     let down = _mm_srli_epi64(x, 7);

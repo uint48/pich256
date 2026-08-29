@@ -7,30 +7,34 @@
 //!
 //! # Feature ladder
 //!
-//! | Backend      | Requires                                | S-box strategy                      |
-//! |--------------|-----------------------------------------|-------------------------------------|
-//! | `Avx512Vbmi` | `avx512f avx512bw avx512vl avx512vbmi`  | 2x `vpermi2b` over a 256-byte table |
-//! | `Avx2`       | `avx2`                                  | 16x `vpshufb` on 32 bytes at a time |
-//! | `Ssse3`      | `ssse3`                                 | 16x `pshufb` on 16 bytes at a time  |
-//! | `Sse2`       | x86_64 baseline                         | scalar table lookup                 |
+//! | Backend      | Requires                                | S-box strategy                       |
+//! |--------------|-----------------------------------------|--------------------------------------|
+//! | `AesNi`      | `aes ssse3`                             | `pshufb` + `aesenclast`, key XOR free |
+//! | `Gfni`       | `gfni`                                  | one `gf2p8affineinv`                 |
+//! | `Avx512Vbmi` | `avx512f avx512bw avx512vl avx512vbmi`  | 2x `vpermi2b` over a 256-byte table  |
+//! | `Avx2`       | `avx2`                                  | 8x `vpshufb`, two rows per register  |
+//! | `Ssse3`      | `ssse3`                                 | 16x `pshufb`, one row per register   |
+//! | `Sse2`       | x86_64 baseline                         | scalar table lookup                  |
 //!
-//! # Deliberately unused instructions
+//! Pich256's confusion layer is the Rijndael S-box, so on any CPU with AES
+//! hardware the substitution is available directly - see [`aes`]. The shuffle
+//! backends in [`sbox`] emulate the same 256-entry table out of 16-entry byte
+//! shuffles, and exist for CPUs without AES-NI or GFNI. They are roughly 3x
+//! slower end to end, but they are constant-time, which the scalar table in
+//! `arch::fallback` is not.
 //!
-//! * **AES-NI** (`aesenclast`) computes AES `SubBytes` + `ShiftRows` in a single
-//!   instruction and would make the S-box nearly free. It is *not* used here:
-//!   Pich256 is meant to stand on its own primitives, not on an AES core.
-//! * **GFNI** (`vgf2p8affineinvqb`) is a general Galois-field instruction, but
-//!   with the Rijndael affine constant it is literally the AES S-box in one
-//!   instruction. It is left out for the same reason, even though the detection
-//!   code reports whether the host has it.
-//!
-//! Both are easy to slot in later as extra `Backend` variants.
+//! The two hardware paths differ in what they fold in: `aesenclast` performs
+//! `SubBytes(ShiftRows(x)) XOR k`, so cancelling its `ShiftRows` with one
+//! `pshufb` yields the substitution *and* the round's key mixing in two
+//! instructions, whereas `gf2p8affineinv` gives a bare `SubBytes` in one
+//! instruction and needs a separate `pxor`. On the hardware this was developed
+//! on the AES-NI form wins, so it is the one the detector prefers; the reasoning
+//! is spelled out in `arch::detect`.
 
-/// Inline-assembly 128-bit integer primitives. Gated on `asm` rather than
-/// `simd`: they are independent of the vector backends and can be enabled or
-/// disabled on their own.
-#[cfg(feature = "asm")]
 pub mod int;
+
+#[cfg(feature = "simd")]
+pub mod aes;
 
 #[cfg(feature = "simd")]
 pub mod sbox;

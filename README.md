@@ -22,9 +22,10 @@ keystream produced by an evolving 128-bit state.
 - **Data-dependent keystream tap** — each output byte is read from a position
   chosen by the state itself.
 - **Symmetric API** — `encrypt` and `decrypt` are the same XOR operation.
-- **Runtime-dispatched hardware acceleration** — x86_64 SIMD intrinsics and
-  inline assembly, selected by CPU detection at runtime, with a portable
-  software fallback on every other target. See
+- **Runtime-dispatched hardware acceleration** — AES-NI/GFNI for the S-box,
+  SHA-NI for the KDF, SIMD intrinsics and inline assembly elsewhere, selected by
+  CPU detection at runtime, with a portable software fallback everywhere else.
+  ~2.8× on the cipher, ~6× on SHA-256. See
   [Hardware acceleration](#hardware-acceleration).
 
 ## How it works (at a glance)
@@ -54,32 +55,57 @@ supported backend against the portable reference.
 
 | Backend | Requires | S-box strategy |
 | :--- | :--- | :--- |
+| `x86_64/aes-ni` | `aes ssse3` | `pshufb` + `aesenclast`, round-key XOR free |
+| `x86_64/gfni` | `gfni` | one `gf2p8affineinv` |
 | `x86_64/avx512vbmi` | `avx512f avx512bw avx512vl avx512vbmi` | 2× `vpermi2b` over a 256-byte table |
 | `x86_64/avx2` | `avx2` | 8× `vpshufb`, two table rows per register |
 | `x86_64/ssse3` | `ssse3` | 16× `pshufb`, one table row per register |
 | `x86_64/sse2` | x86_64 baseline | scalar table lookup, vector XOR |
 | `portable` | anything | plain Rust |
 
-Alongside the vector S-box:
+Alongside the S-box:
 
 - **SHA-NI** (`sha256rnds2` / `sha256msg1` / `sha256msg2`) for the SHA-256
-  compression behind the KDF — the single biggest win, ~6× over the scalar loop.
+  compression behind the KDF — ~6× over the scalar loop.
 - **Inline assembly** for the 128-bit primitives: `shld`/`shrd` double-precision
   shifts for the rotates, and `mul`/`imul` for the truncating 128×128 multiply.
 - **SSE2/AVX2** for the state rotate and the bulk keystream XOR.
 
-### Deliberately unused
+### Using the AES hardware
 
-**AES-NI is not used.** `aesenclast` computes AES `SubBytes` in one instruction
-and would make the S-box nearly free, but Pich256 is meant to stand on its own
-primitives rather than on an AES core. **GFNI** (`vgf2p8affineinvqb`) is left out
-for the same reason — with the Rijndael affine constant it is literally the AES
-S-box in hardware. Both are straightforward to add later as extra `Backend`
-variants; `arch::cpu_summary()` already reports whether the host has them.
+Pich256's confusion layer *is* the Rijndael S-box, so the substitution it needs
+has been in x86_64 silicon since 2010. Two unrelated instruction sets provide it.
 
-A side benefit of avoiding table lookups: the vector S-box never indexes memory
-with secret data, so those backends are **constant-time**, unlike the scalar
-table path.
+**AES-NI.** `aesenclast(x, k)` is a whole final AES round,
+`SubBytes(ShiftRows(x)) ⊕ k`. `SubBytes` is bytewise and `ShiftRows` is a byte
+permutation, so they commute and the `ShiftRows` can be cancelled by permuting
+the input first:
+
+```
+aesenclast(InvShiftRows(x), k) = SubBytes(x) ⊕ k
+```
+
+`InvShiftRows` is one `pshufb`, so the S-box costs two instructions — and the
+`⊕ k` arrives free, meaning `aesenclast` also absorbs the round's key-mixing
+step. A full Pich256 round is the rotate, one `pshufb`, one `aesenclast`.
+
+**GFNI.** `vgf2p8affineinvqb(x, A, b)` inverts each byte in GF(2⁸) under the AES
+polynomial and applies the affine map `A·inv(x) + b` — the textbook definition of
+the Rijndael S-box. With the Rijndael matrix and `b = 0x63` the substitution is a
+*single* instruction, though the key XOR then costs a separate `pxor`.
+
+AES-NI is preferred by the detector: folding in the key XOR makes it consistently
+faster here (3.9 vs 4.1 ns/byte end to end). Since every CPU with GFNI also has
+AES-NI, GFNI is in practice a documented alternative reachable via
+`arch::force_backend`.
+
+Both identities and both magic constants are checked against the 256-entry table
+in **every one of the 16 lane positions** — a wrong `InvShiftRows` mask still
+yields a permutation of the right bytes, so uniform test input would not catch it.
+
+The shuffle-based backends (`avx512vbmi` / `avx2` / `ssse3`) emulate the same
+table out of 16-entry byte shuffles and remain for CPUs without AES hardware, or
+VMs that mask the feature bits off.
 
 ### Measuring it
 
@@ -88,20 +114,23 @@ cargo run --release --example arch_bench
 ```
 
 reports the detected backend and times every supported path against the portable
-one. Measured on a Zen-class CPU with AVX2 + SHA-NI:
+one. Measured on a CPU with AES-NI, GFNI, AVX2 and SHA-NI:
 
-| Workload | Best hardware path | Portable |
-| :--- | ---: | ---: |
-| `sha256_compress` | 0.41 ns/byte (SHA-NI) | 2.55 ns/byte |
-| `Pich256::encrypt` end to end | 9.7 ns/byte (AVX2) | 10.4 ns/byte |
+Mean of five runs:
 
-The honest picture: SHA-256 gains ~6×, while the cipher core gains only ~7%.
-A 256-entry byte substitution is close to the worst case for SIMD — an L1 table
-lookup is a single micro-op, whereas `pshufb` covers just 16 entries at a time —
-and the cipher's two full-state rounds per output byte are a serial dependency
-chain that no amount of width can shorten. An SSSE3-only CPU is in fact *slower*
-than the scalar table (13.2 vs 10.4 ns/byte); it is kept for its constant-time
-property, and `arch::force_backend` can select otherwise.
+| Workload | AES-NI | GFNI | AVX2 | SSSE3 | Portable |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| `sub_bytes`, 64 KiB | **0.026** | 0.025 | 0.246 | 0.273 | 0.158 ns/byte |
+| `Pich256::encrypt` | **3.88** | 4.11 | 10.11 | 13.72 | 10.96 ns/byte |
+| `sha256_compress` | **0.43** (SHA-NI) | — | — | — | 2.76 ns/byte |
+
+The cipher runs **~2.8× faster** on AES hardware, and bulk substitution ~6×.
+Without it the picture is much flatter: a 256-entry byte substitution is close to
+the worst case for SIMD — an L1 table lookup is a single micro-op, whereas
+`pshufb` covers just 16 entries at a time — so the AVX2 path wins the
+latency-bound inner loop by only ~7%, and an SSSE3-only CPU is in fact *slower*
+than the scalar table. Those paths are kept for their constant-time property,
+which the AES-hardware paths share and the scalar table does not.
 
 ### Features
 
@@ -184,7 +213,8 @@ src/
     ├── mod.rs       runtime CPU detection + dispatched primitives
     ├── fallback.rs  portable reference implementation (all targets)
     └── x86_64/
-        ├── sbox.rs  SSSE3 / AVX2 / AVX-512 S-box, round and keystream
+        ├── aes.rs   AES-NI / GFNI S-box, round and keystream
+        ├── sbox.rs  SSSE3 / AVX2 / AVX-512 S-box (no AES hardware needed)
         ├── int.rs   inline asm: shld/shrd rotates, mul/imul multiply
         └── sha.rs   SHA-NI block compression
 ```
@@ -192,8 +222,8 @@ src/
 ## Roadmap / TODO
 
 - [x] **Hardware acceleration with software fallback** — runtime CPU detection
-  dispatching to SIMD and inline-assembly implementations on x86_64, with a
-  portable pure-Rust path everywhere else. See
+  dispatching to AES-NI/GFNI, SHA-NI, SIMD and inline-assembly implementations on
+  x86_64, with a portable pure-Rust path everywhere else. See
   [Hardware acceleration](#hardware-acceleration).
 - [ ] **Backends for other architectures** — aarch64 NEON (`tbl`/`tbx` are a
   natural fit for the S-box) and wasm32 SIMD128. The dispatch layer and its
